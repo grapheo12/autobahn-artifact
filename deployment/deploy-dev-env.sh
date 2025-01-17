@@ -26,8 +26,17 @@ DEV_USER=pftadmin
 DEV_SSH_KEY=cluster_key.pem
 
 ssh -i $DEV_SSH_KEY $DEV_USER@$DEV_VM 'mkdir -p ~/pft-dev/logs'
-scp -r -q -p -i $DEV_SSH_KEY $CWD/benches $DEV_USER@$DEV_VM:~/pft-dev
-scp -r -q -p -i $DEV_SSH_KEY $CWD/src $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/benchmark $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/config $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/consensus $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/crypto $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/hotstuff $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/network $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/node $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/primary $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/sailfish $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/store $DEV_USER@$DEV_VM:~/pft-dev
+scp -r -q -p -i $DEV_SSH_KEY $CWD/worker $DEV_USER@$DEV_VM:~/pft-dev
 
 # Need to clear pycache and venv locally before sending over
 rm -r $CWD/scripts/venv
@@ -52,7 +61,6 @@ popd
 
 # Makefile and other rust things
 scp -q -p -i deployment/$DEV_SSH_KEY Makefile $DEV_USER@$DEV_VM:~/pft-dev
-scp -q -p -i deployment/$DEV_SSH_KEY build.rs $DEV_USER@$DEV_VM:~/pft-dev
 scp -q -p -i deployment/$DEV_SSH_KEY Cargo.toml $DEV_USER@$DEV_VM:~/pft-dev
 scp -q -p -i deployment/$DEV_SSH_KEY Cargo.lock $DEV_USER@$DEV_VM:~/pft-dev
 

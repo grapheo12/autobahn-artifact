@@ -24,6 +24,11 @@ class CommandMaker:
     def generate_key(filename):
         assert isinstance(filename, str)
         return f'./node generate_keys --filename {filename}'
+    
+    @staticmethod
+    def generate_key_from_target(filename):
+        assert isinstance(filename, str)
+        return f'./target/release/node generate_keys --filename {filename}'
 
     @staticmethod
     def run_primary(keys, committee, store, parameters, debug=False):
