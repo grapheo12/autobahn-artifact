@@ -1,15 +1,17 @@
 # Copyright (c) Shubham Mishra. All rights reserved.
 # Licensed under the MIT License.
 
+from math import ceil
 import os
 from fabric import Connection
 from fabric.runners import Result
 from typing import List, Tuple, OrderedDict, Dict
 import invoke
 import click
+from benchmark.config import BenchParameters
 from benchmark.commands import CommandMaker
 import gen_autobahn_config
-from gen_autobahn_config import gen_config, PathMaker
+from gen_autobahn_config import RemoteCommittee, gen_config, PathMaker
 import collections
 import datetime
 import json
@@ -111,23 +113,16 @@ def create_dirs_and_copy_files(node_conns, client_conns, wd, repeat, git_hash, c
         conn.put("target/release/node", remote=f"pft/{wd}/target/release/server_{node}")
         # conn.put("target/release/net-perf", remote=f"pft/{wd}/target/release/net-perf")
 
-    # for client, conn in client_conns.items():
-    #     run_all([
-    #         f"mkdir -p pft/{wd}",
-    #         f"echo '{git_hash}' > pft/{wd}/git_hash.txt",
-    #         f"mkdir -p pft/{wd}/target/release",
-    #         f"mkdir -p pft/{wd}/configs"
-    #     ] + [f"mkdir -p pft/{wd}/logs/{i}" for i in range(repeat)], conn)
+    for client, conn in client_conns.items():
+        run_all([
+            f"mkdir -p pft/{wd}",
+            f"echo '{git_hash}' > pft/{wd}/git_hash.txt",
+            f"mkdir -p pft/{wd}/target/release",
+            f"mkdir -p pft/{wd}/configs"
+        ] + [f"mkdir -p pft/{wd}/logs/{i}" for i in range(repeat)], conn)
 
         
-    #     with open(f"configs/{client}{CONFIG_SUFFIX}") as f:
-    #         cfg = json.load(f)
-        
-    #     conn.put(f"{cfg['net_config']['tls_root_ca_cert_path']}", remote=f"pft/{wd}/configs/")
-    #     conn.put(f"{cfg['rpc_config']['signing_priv_key_path']}", remote=f"pft/{wd}/configs/")
-
-    #     conn.put(f"configs/{client}{CONFIG_SUFFIX}", remote=f"pft/{wd}/configs/")
-    #     conn.put("target/release/client", remote=f"pft/{wd}/target/release")
+        conn.put("target/release/benchmark_client", remote=f"pft/{wd}/target/release")
 
 
 def run_nodes(node_conns: Dict[str, Connection], repeat_num: int, wd: str, num_workers: int) -> List:
@@ -175,13 +170,25 @@ def run_nodes_with_net_perf(node_conns: Dict[str, Connection], repeat_num: int, 
 
 
 
-def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str) -> List:
+def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, num_nodes: int, bench_params: BenchParameters, committee: RemoteCommittee) -> List:
     promises = []
+
+    # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
+    # The rate will be divided among client VMs.
+    rate_per_vm = ceil(bench_params['rate'][repeat_num] / len(client_conns.keys()))
+    node_addrs = committee.workers_addresses(0)
     
-    # for client, conn in client_conns.items():
-    #     prom = conn.run(f"cd pft/{wd} && ./target/release/client configs/{client}{CONFIG_SUFFIX} > logs/{repeat_num}/{client}.log 2> logs/{repeat_num}/{client}.err",
-    #              pty=True, asynchronous=True, hide=True)
-    #     promises.append(prom)
+    for client, conn in client_conns.items():
+        for i, addresses in enumerate(node_addrs):
+            for (id, addr) in addresses:
+                cmd = CommandMaker.run_client(
+                    addr, bench_params['tx_size'], rate_per_vm,
+                    [x for y in node_addrs for _, x in y],
+                    binary_name="./target/release/benchmark_client"
+                )
+                prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/{client}-{i}-{id}.log 2> logs/{repeat_num}/{client}-{i}-{id}.err",
+                        pty=True, asynchronous=True, hide=True)
+                promises.append(prom)
 
     return promises
 
@@ -190,7 +197,7 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str) -
 def kill_clients(client_conns: Dict[str, Connection]):
     for conn in client_conns.values():
         run_all([
-            "pkill -c client"       # There better not be any other process that matches this.
+            "pkill -c benchmark_client"       # There better not be any other process that matches this.
         ], conn)
 
 
@@ -212,13 +219,20 @@ def copy_log(name: str, conn: Connection, repeat_num: int, wd: str):
     conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.log", local=f"logs/{wd}/{repeat_num}/")
     conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.err", local=f"logs/{wd}/{repeat_num}/")
 
-def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, controller_total_logs=0):
+def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, controller_total_logs=0, committee=None):
     invoke.run(f"mkdir -p logs/{wd}/{repeat_num}", hide=True)
     for node, conn in node_conns.items():
         copy_log(node, conn, repeat_num, wd)
 
-    # for client, conn in client_conns.items():
-    #     copy_log(client, conn, repeat_num, wd)
+    if committee is None:
+        return
+    
+    node_addrs = committee.workers_addresses(0)
+    
+    for client, conn in client_conns.items():
+        for i, addresses in enumerate(node_addrs):
+            for (id, _addr) in addresses:
+                copy_log(f"{client}-{i}-{id}", conn, repeat_num, wd)
 
 
 def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
@@ -231,7 +245,7 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
     node_params = gen_autobahn_config.NodeParameters(node_params)
 
     ip_list_ = list(nodes.values())
-    gen_autobahn_config.gen_config(num_nodes, 3000, num_workers, node_params, ip_list_)
+    committee = gen_autobahn_config.gen_config(num_nodes, 3000, num_workers, node_params, ip_list_)
 
     print("Creating SSH connections")
     node_conns = {node: Connection(
@@ -267,7 +281,7 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
         time.sleep(1)
 
         print("Running clients")
-        promises.extend(run_clients(client_conns, i, curr_time))
+        promises.extend(run_clients(client_conns, i, curr_time, num_nodes, bench_params, committee))
 
         print("Running experiments for", seconds, "seconds")
         time.sleep(seconds)
@@ -305,7 +319,7 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
 
                 
         print("Copying logs")
-        copy_logs(node_conns, client_conns, i, curr_time)
+        copy_logs(node_conns, client_conns, i, curr_time, committee=committee)
 
 
 @click.command()

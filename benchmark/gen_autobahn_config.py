@@ -33,6 +33,8 @@ def gen_config(nodes: int, base_port: int, workers: int, node_parameters: NodePa
 
     node_parameters.print(PathMaker.parameters_file())
 
+    return committee
+
 
 # All gen_*_nodelist functions return: dict(node -> (ip, domain name)) and number of clients
 def gen_cluster_nodelist(ip_list, domain_suffix, cnt_start=0, max_nodes=-1) -> Tuple[OrderedDict[str, Tuple[str, str]], int]:
@@ -62,10 +64,10 @@ def gen_cluster_nodelist(ip_list, domain_suffix, cnt_start=0, max_nodes=-1) -> T
 def get_default_node_params(num_nodes, repeats, seconds):
     bench_params = {
         'faults': 0,
-        'nodes': [num_nodes],
+        'nodes': [num_nodes] * repeats,
         'workers': 1,
         'co-locate': True,
-        'rate': [240_000],
+        'rate': [240_000] * repeats,
         'tx_size': 512,
         'duration': seconds,
         'runs': repeats,
