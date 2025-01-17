@@ -26,7 +26,8 @@ DEV_USER=pftadmin
 DEV_SSH_KEY=cluster_key.pem
 
 ssh -i $DEV_SSH_KEY $DEV_USER@$DEV_VM 'mkdir -p ~/pft-dev/logs'
-scp -r -q -p -i $DEV_SSH_KEY $CWD/benchmark $DEV_USER@$DEV_VM:~/pft-dev
+ssh -i $DEV_SSH_KEY $DEV_USER@$DEV_VM 'mkdir -p ~/pft-dev/benchmark'
+scp -r -q -p -i $DEV_SSH_KEY $CWD/benchmark/benchmark $DEV_USER@$DEV_VM:~/pft-dev/benchmark
 scp -r -q -p -i $DEV_SSH_KEY $CWD/config $DEV_USER@$DEV_VM:~/pft-dev
 scp -r -q -p -i $DEV_SSH_KEY $CWD/consensus $DEV_USER@$DEV_VM:~/pft-dev
 scp -r -q -p -i $DEV_SSH_KEY $CWD/crypto $DEV_USER@$DEV_VM:~/pft-dev

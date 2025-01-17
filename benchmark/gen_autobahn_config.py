@@ -59,22 +59,7 @@ def gen_cluster_nodelist(ip_list, domain_suffix, cnt_start=0, max_nodes=-1) -> T
 
     return (nodelist, client_cnt)
 
-
-
-@click.command()
-@click.option(
-    "-n", "--num_nodes",
-    default=4,
-    help="Number of nodes",
-    type=click.INT
-)
-@click.option(
-    "-ips", "--ip_list",
-    default="/dev/null",
-    help="File with list of node names and IP addresses to be used with cluster config",
-    type=click.Path(exists=True, file_okay=True, resolve_path=True)
-)
-def main(num_nodes, ip_list):
+def get_default_node_params(num_nodes, repeats, seconds):
     bench_params = {
         'faults': 0,
         'nodes': [num_nodes],
@@ -82,8 +67,8 @@ def main(num_nodes, ip_list):
         'co-locate': True,
         'rate': [240_000],
         'tx_size': 512,
-        'duration': 60,
-        'runs': 1,
+        'duration': seconds,
+        'runs': repeats,
 
         # Unused
         'simulate_partition': True,
@@ -113,6 +98,24 @@ def main(num_nodes, ip_list):
         'asynchrony_duration': 3_000, #ms
     }
 
+    return bench_params, node_params
+
+
+@click.command()
+@click.option(
+    "-n", "--num_nodes",
+    default=4,
+    help="Number of nodes",
+    type=click.INT
+)
+@click.option(
+    "-ips", "--ip_list",
+    default="/dev/null",
+    help="File with list of node names and IP addresses to be used with cluster config",
+    type=click.Path(exists=True, file_okay=True, resolve_path=True)
+)
+def main(num_nodes, ip_list):
+    bench_params, node_params = get_default_node_params(num_nodes, 1, 60)
     base_port = 3000
     workers = bench_params['workers']
     node_params = NodeParameters(node_params)

@@ -20,24 +20,24 @@ class PathMaker:
         return join('..', 'node')
 
     @staticmethod
-    def committee_file():
-        return '.committee.json'
+    def committee_file(path_prefix=""):
+        return f'{path_prefix}.committee.json'
 
     @staticmethod
-    def parameters_file():
-        return '.parameters.json'
+    def parameters_file(path_prefix=""):
+        return f'{path_prefix}.parameters.json'
 
     @staticmethod
-    def key_file(i):
+    def key_file(i, path_prefix=""):
         assert isinstance(i, int) and i >= 0
-        return f'.node-{i}.json'
+        return f'{path_prefix}.node-{i}.json'
 
     @staticmethod
-    def db_path(i, j=None):
+    def db_path(i, j=None, path_prefix=""):
         assert isinstance(i, int) and i >= 0
         assert (isinstance(j, int) and i >= 0) or j is None
         worker_id = f'-{j}' if j is not None else ''
-        return f'.db-{i}{worker_id}'
+        return f'{path_prefix}.db-{i}{worker_id}'
 
     @staticmethod
     def logs_path():
