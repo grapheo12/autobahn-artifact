@@ -8,6 +8,7 @@ from fabric.runners import Result
 from typing import List, Tuple, OrderedDict, Dict
 import invoke
 import click
+from benchmark.logs import LogParser
 from benchmark.config import BenchParameters
 from benchmark.commands import CommandMaker
 import gen_autobahn_config
@@ -138,7 +139,8 @@ def run_nodes(node_conns: Dict[str, Connection], repeat_num: int, wd: str, num_w
             debug=True,
             binary_name=binary_name
         )
-        prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/{node}.log 2> logs/{repeat_num}/{node}.err",
+        # Log parser expects primary logs to start with primary-
+        prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/primary-{node}.err 2> logs/{repeat_num}/primary-{node}.log",
                     pty=True, asynchronous=True, hide=True)
         promises.append(prom)
 
@@ -152,7 +154,8 @@ def run_nodes(node_conns: Dict[str, Connection], repeat_num: int, wd: str, num_w
                     debug=True,
                     binary_name=binary_name
                 )
-            prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/{node}.log 2> logs/{repeat_num}/{node}.err",
+            # Log parser expects primary logs to start with worker-
+            prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/worker-{node}-{worker_num}.err 2> logs/{repeat_num}/worker-{node}-{worker_num}.log",
                     pty=True, asynchronous=True, hide=True)
             promises.append(prom)
 
@@ -174,8 +177,8 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
     promises = []
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
-    # The rate will be divided among client VMs.
-    rate_per_vm = ceil(bench_params['rate'][repeat_num] / len(client_conns.keys()))
+    # The rate will be divided among client VMs and then within VMs to each of the client binaries.
+    rate_per_vm = ceil(bench_params['rate'][repeat_num] / len(client_conns.keys()) / num_nodes)
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
@@ -186,7 +189,8 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
                     [x for y in node_addrs for _, x in y],
                     binary_name="./target/release/benchmark_client"
                 )
-                prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/{client}-{i}-{id}.log 2> logs/{repeat_num}/{client}-{i}-{id}.err",
+                # Log parser expects primary logs to start with client-
+                prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/client-{client}-{i}-{id}.err 2> logs/{repeat_num}/client-{client}-{i}-{id}.log",
                         pty=True, asynchronous=True, hide=True)
                 promises.append(prom)
 
@@ -219,10 +223,12 @@ def copy_log(name: str, conn: Connection, repeat_num: int, wd: str):
     conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.log", local=f"logs/{wd}/{repeat_num}/")
     conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.err", local=f"logs/{wd}/{repeat_num}/")
 
-def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, controller_total_logs=0, committee=None):
+def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, controller_total_logs=0, committee=None, num_workers=0):
     invoke.run(f"mkdir -p logs/{wd}/{repeat_num}", hide=True)
     for node, conn in node_conns.items():
-        copy_log(node, conn, repeat_num, wd)
+        copy_log(f"primary-{node}", conn, repeat_num, wd)
+        for worker_num in range(num_workers):
+            copy_log(f"worker-{node}-{worker_num}", conn, repeat_num, wd)
 
     if committee is None:
         return
@@ -232,10 +238,10 @@ def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, co
     for client, conn in client_conns.items():
         for i, addresses in enumerate(node_addrs):
             for (id, _addr) in addresses:
-                copy_log(f"{client}-{i}-{id}", conn, repeat_num, wd)
+                copy_log(f"client-{client}-{i}-{id}", conn, repeat_num, wd)
 
 
-def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
+def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
     # build_project()
     git_hash = get_current_git_hash()
     # gen_config("configs", "cluster", node_template, client_template, ip_list, -1)
@@ -319,7 +325,10 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds):
 
                 
         print("Copying logs")
-        copy_logs(node_conns, client_conns, i, curr_time, committee=committee)
+        copy_logs(node_conns, client_conns, i, curr_time, committee=committee, num_workers=num_workers)
+        with open(f"logs/{curr_time}/{i}/result.txt", "w") as f:
+            print(LogParser.process(f"logs/{curr_time}/{i}").result(), file=f)
+
 
 
 @click.command()

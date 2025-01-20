@@ -67,7 +67,7 @@ def get_default_node_params(num_nodes, repeats, seconds):
         'nodes': [num_nodes] * repeats,
         'workers': 1,
         'co-locate': True,
-        'rate': [240_000] * repeats,
+        'rate': [411_000] * repeats,
         'tx_size': 512,
         'duration': seconds,
         'runs': repeats,
