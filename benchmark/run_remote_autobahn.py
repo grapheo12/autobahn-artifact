@@ -136,7 +136,7 @@ def run_nodes(node_conns: Dict[str, Connection], repeat_num: int, wd: str, num_w
             PathMaker.committee_file(path_prefix="configs/"),
             PathMaker.db_path(node_num, path_prefix=""),
             PathMaker.parameters_file(path_prefix="configs/"),
-            debug=True,
+            debug=False,
             binary_name=binary_name
         )
         # Log parser expects primary logs to start with primary-
@@ -151,7 +151,7 @@ def run_nodes(node_conns: Dict[str, Connection], repeat_num: int, wd: str, num_w
                     PathMaker.db_path(node_num, worker_num),
                     PathMaker.parameters_file(path_prefix="configs/"),
                     worker_num,
-                    debug=True,
+                    debug=False,
                     binary_name=binary_name
                 )
             # Log parser expects primary logs to start with worker-
@@ -247,6 +247,10 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
     # gen_config("configs", "cluster", node_template, client_template, ip_list, -1)
     nodes, clients = tag_all_machines(ip_list)
     bench_params, node_params = gen_autobahn_config.get_default_node_params(num_nodes, repeat, seconds)
+    if not(rates is None):
+        assert len(rates) == repeat
+        bench_params["rate"] = rates[:]
+
     num_workers = bench_params['workers']
     node_params = gen_autobahn_config.NodeParameters(node_params)
 
@@ -329,6 +333,8 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
         with open(f"logs/{curr_time}/{i}/result.txt", "w") as f:
             print(LogParser.process(f"logs/{curr_time}/{i}").result(), file=f)
 
+        time.sleep(10)
+
 
 
 @click.command()
@@ -361,8 +367,17 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
     help="Seconds to run each experiment",
     type=click.INT
 )
-def main(num_nodes, ip_list, identity_file, repeat, seconds):
-    run_remote(num_nodes, ip_list, identity_file, repeat, seconds)
+@click.option(
+    "-rate", "--rates",
+    default=[], multiple=True,
+    type=click.INT,
+    help="Rates to be used for the runs"
+)
+def main(num_nodes, ip_list, identity_file, repeat, seconds, rates):
+    rates = list(rates)
+    if len(rates) == 0:
+        rates = None
+    run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=rates)
 
     
     
