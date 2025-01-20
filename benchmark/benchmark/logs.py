@@ -184,18 +184,20 @@ class LogParser:
         list_latencies = []
         first_start = 0
         set_first = True
-        for sent, received in zip(self.sent_samples, self.received_samples):
+        for received in self.received_samples:
             for tx_id, batch_id in received.items():
                 if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
-                    start = sent[tx_id]
-                    end = self.commits[batch_id]
-                    if set_first:
-                        first_start = start
-                        first_end = end
-                        set_first = False
-                    latency += [end-start]
-                    list_latencies += [(start-first_start, end-first_start, end-start)]
+                    # assert tx_id in sent  # We receive txs that we sent.
+                    for _sent in self.sent_samples:
+                        if tx_id in _sent:
+                            start = _sent[tx_id]
+                            end = self.commits[batch_id]
+                            if set_first:
+                                first_start = start
+                                first_end = end
+                                set_first = False
+                            latency += [end-start]
+                            list_latencies += [(start-first_start, end-first_start, end-start)]
 
         list_latencies.sort(key=lambda tup: tup[0])
         with open('latencies.txt', 'w') as f:

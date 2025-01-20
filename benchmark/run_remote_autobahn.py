@@ -178,7 +178,7 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
     # The rate will be divided among client VMs and then within VMs to each of the client binaries.
-    rate_per_vm = ceil(bench_params['rate'][repeat_num] / len(client_conns.keys()) / num_nodes)
+    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
@@ -246,10 +246,8 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
     git_hash = get_current_git_hash()
     # gen_config("configs", "cluster", node_template, client_template, ip_list, -1)
     nodes, clients = tag_all_machines(ip_list)
-    bench_params, node_params = gen_autobahn_config.get_default_node_params(num_nodes, repeat, seconds)
-    if not(rates is None):
-        assert len(rates) == repeat
-        bench_params["rate"] = rates[:]
+    bench_params, node_params = gen_autobahn_config.get_default_node_params(num_nodes, 1, seconds)
+    
 
     num_workers = bench_params['workers']
     node_params = gen_autobahn_config.NodeParameters(node_params)
@@ -283,6 +281,9 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
 
     for i in range(repeat):
         print("Experiment sequence num:", i)
+        if not(rates is None):
+            assert len(rates) == repeat
+            bench_params["rate"] = [rates[i]]
 
         print("Running Nodes")
         promises = []
@@ -377,6 +378,8 @@ def main(num_nodes, ip_list, identity_file, repeat, seconds, rates):
     rates = list(rates)
     if len(rates) == 0:
         rates = None
+    elif len(rates) == 1 and repeat > 1:
+        rates = [rates[0]] * repeat
     run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=rates)
 
     
