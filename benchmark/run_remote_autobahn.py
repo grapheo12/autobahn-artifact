@@ -3,6 +3,7 @@
 
 from math import ceil
 import os
+import shutil
 from fabric import Connection
 from fabric.runners import Result
 from typing import List, Tuple, OrderedDict, Dict
@@ -178,14 +179,18 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
     # The rate will be divided among client VMs and then within VMs to each of the client binaries.
-    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    # rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
         for i, addresses in enumerate(node_addrs):
+            _rate = 1000
+            if i == 0:
+                _rate = rate_per_vm
             for (id, addr) in addresses:
                 cmd = CommandMaker.run_client(
-                    addr, bench_params['tx_size'], rate_per_vm,
+                    addr, bench_params['tx_size'], _rate,
                     [x for y in node_addrs for _, x in y],
                     binary_name="./target/release/benchmark_client"
                 )
@@ -193,6 +198,8 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
                 prom = conn.run(f"cd pft/{wd} && {cmd} > logs/{repeat_num}/client-{client}-{i}-{id}.err 2> logs/{repeat_num}/client-{client}-{i}-{id}.log",
                         pty=True, asynchronous=True, hide=True)
                 promises.append(prom)
+            # if i == 2:
+            #     break
 
     return promises
 
@@ -220,8 +227,34 @@ def kill_nodes_with_net_perf(node_conns: Dict[str, Connection]):
         ], conn)
 
 def copy_log(name: str, conn: Connection, repeat_num: int, wd: str):
-    conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.log", local=f"logs/{wd}/{repeat_num}/")
-    conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.err", local=f"logs/{wd}/{repeat_num}/")
+    must_delete_log = False
+    must_delete_err = False
+
+    try:
+        conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.log", local=f"logs/{wd}/{repeat_num}/")
+        if os.path.getsize(f"logs/{wd}/{repeat_num}/{name}.log") == 0:
+            raise Exception
+    except:
+        must_delete_log = True
+    
+    try:
+        conn.get(f"pft/{wd}/logs/{repeat_num}/{name}.err", local=f"logs/{wd}/{repeat_num}/")
+        if os.path.getsize(f"logs/{wd}/{repeat_num}/{name}.err") == 0:
+            raise Exception
+    except:
+        must_delete_err = True
+
+    if must_delete_err or must_delete_log:
+        time.sleep(1)
+        try:
+            if must_delete_log:
+                os.remove(f"logs/{wd}/{repeat_num}/{name}.log")
+            if must_delete_err:
+                os.remove(f"logs/{wd}/{repeat_num}/{name}.err")
+        except:
+            pass
+
+
 
 def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, controller_total_logs=0, committee=None, num_workers=0):
     invoke.run(f"mkdir -p logs/{wd}/{repeat_num}", hide=True)

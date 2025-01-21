@@ -121,6 +121,7 @@ impl Client {
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter | (r << 32)); // This counter identifies the tx.
+                    r += 1;
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
