@@ -145,7 +145,9 @@ impl Worker {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
-
+        
+        // To get information about committed batch hashes, this will be used to reply back to the clients.
+        let (tx_batch_commit, rx_batch_commit) = channel(CHANNEL_CAPACITY);
         // We first receive clients' transactions from the network.
         let mut address = self
             .committee
@@ -173,6 +175,7 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
+            rx_batch_commit
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -192,6 +195,7 @@ impl Worker {
             /* rx_batch */ rx_processor,  //receiver channel to connect to quorum waiter
             /* tx_digest */ tx_primary,   //sender channel to connect to PrimaryConnector
             /* own_batch */ true,
+            tx_batch_commit
         );
 
         info!(
@@ -231,12 +235,15 @@ impl Worker {
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
         // batch's digest to the `PrimaryConnector` that will send it to our primary.
+        let (tx_batch_commit, _rx_batch_commit) = channel(CHANNEL_CAPACITY);
+
         Processor::spawn(
             self.id,
             self.store.clone(),
             /* rx_batch */ rx_processor,   //receiver channel to connect to WorkerReceiverHandler
             /* tx_digest */ tx_primary,    //sender channel to connect to PrimaryConnector
             /* own_batch */ false,
+            tx_batch_commit // this is not used here.
         );
 
         info!(

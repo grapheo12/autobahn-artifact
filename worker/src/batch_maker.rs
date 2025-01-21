@@ -6,7 +6,8 @@ use crate::worker::WorkerMessage;
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
-use crypto::PublicKey;
+use crypto::{Hash, PublicKey};
+use ed25519_dalek::{Digest, Sha512};
 #[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
 use log::debug;
@@ -14,6 +15,7 @@ use log::debug;
 use log::info;
 use network::{ReliableSender, SimpleSender};
 use tokio::sync::oneshot;
+use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -37,6 +39,8 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>,
+
+    rx_batch_commit: Receiver<Vec<u8>>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
@@ -46,6 +50,7 @@ pub struct BatchMaker {
     /// Holds the current batch.
     current_batch: Batch,
     current_batch_waiters: Vec<oneshot::Sender<()>>,
+    all_batch_waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<()>>>, // batch hash => vec of waiting chans
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
@@ -60,6 +65,7 @@ impl BatchMaker {
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        rx_batch_commit: Receiver<Vec<u8>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -71,8 +77,10 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_waiters: Vec::with_capacity(batch_size * 2),
+                all_batch_waiters: HashMap::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new(),
+                rx_batch_commit
             }
             .run()
             .await;
@@ -102,6 +110,10 @@ impl BatchMaker {
                     }
                 },
 
+                Some(digest) = self.rx_batch_commit.recv() => {
+                    self.reply_all(digest).await;
+                }
+
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     debug!("BatchMaker: max batch delay timer triggered");
@@ -116,6 +128,14 @@ impl BatchMaker {
 
             // Give the change to schedule other tasks.
             tokio::task::yield_now().await;
+        }
+    }
+
+    async fn reply_all(&mut self, digest: Vec<u8>) {
+        if let Some(waiters) = self.all_batch_waiters.remove(&digest) {
+            for tx in waiters {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -169,12 +189,14 @@ impl BatchMaker {
         let bytes = Bytes::from(serialized.clone());
         self.network.broadcast(addresses, bytes).await; 
 
+        let digest =
+            Sha512::digest(&serialized).to_vec();
+
         self.tx_batch.send(serialized).await.expect("Failed to deliver batch");
 
-        // Reply to all waiting clients.
-        for tx in self.current_batch_waiters.drain(..) {
-            let _ = tx.send(());
-        }
+        // Store all 
+        let waiters = self.current_batch_waiters.drain(..).collect();
+        self.all_batch_waiters.insert(digest, waiters);
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.
