@@ -265,7 +265,9 @@ impl MessageHandler for TxReceiverHandler {
             .expect("Failed to send transaction");
 
         // Give the change to schedule other tasks.
-        tokio::task::yield_now().await;
+        // tokio::task::yield_now().await;
+        let _ = _writer.send(Bytes::from("Ack")).await;
+
         Ok(())
     }
 }
