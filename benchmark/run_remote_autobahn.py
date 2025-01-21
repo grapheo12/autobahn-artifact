@@ -179,14 +179,14 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
     # The rate will be divided among client VMs and then within VMs to each of the client binaries.
-    # rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
-    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
+    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    # rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
         for i, addresses in enumerate(node_addrs):
             _rate = 1000
-            if i == 0:
+            if True or (i == 0):
                 _rate = rate_per_vm
             for (id, addr) in addresses:
                 cmd = CommandMaker.run_client(
@@ -208,14 +208,14 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 def kill_clients(client_conns: Dict[str, Connection]):
     for conn in client_conns.values():
         run_all([
-            "pkill -c benchmark_client"       # There better not be any other process that matches this.
+            "pkill -f -c benchmark_client"       # There better not be any other process that matches this.
         ], conn)
 
 
 def kill_nodes(node_conns: Dict[str, Connection]):
     for node, conn in node_conns.items():
         run_all([
-            f"pkill -c server_{node}",           # There better not be any other process that matches this.
+            f"pkill -f -c server_{node}",           # There better not be any other process that matches this.
             f"sleep 1 && rm -rf /home/pftadmin/pft/.db*"  # Give some time to cool off after pkill so that db can be cleared off better.
         ], conn)
 

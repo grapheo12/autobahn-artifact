@@ -16,6 +16,7 @@ use log::{error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use std::error::Error;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
@@ -252,20 +253,22 @@ impl Worker {
 //Note: Only expect to receive client messages submitting new transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
+    tx_batch_maker: Sender<(Transaction, oneshot::Sender<()>)>,  //sender channel to connect to batch maker
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        let (tx, rx) = oneshot::channel();
         // Send the transaction to the batch maker.
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send((message.to_vec(), tx))
             .await
             .expect("Failed to send transaction");
 
         // Give the change to schedule other tasks.
         // tokio::task::yield_now().await;
+        let _ = rx.await;
         let _ = _writer.send(Bytes::from("Ack")).await;
 
         Ok(())

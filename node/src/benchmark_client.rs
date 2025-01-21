@@ -113,7 +113,7 @@ impl Client {
         info!("Start sending transactions");
 
         'main: loop {
-            interval.as_mut().tick().await;
+            // interval.as_mut().tick().await;
             let now = Instant::now();
 
             for x in 0..burst {
@@ -138,11 +138,15 @@ impl Client {
                     break 'main;
                 }
 
+            }
+
+            for _ in 0..burst {
                 if let None = transport_receiver.next().await {
                     warn!("Failed to receive transaction ack");
                     break 'main;
                 }
             }
+
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
                 // NOTE: This log entry is used to compute performance.
                 warn!("Transaction rate too high for this client");

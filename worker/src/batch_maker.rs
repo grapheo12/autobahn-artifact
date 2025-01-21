@@ -13,6 +13,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{ReliableSender, SimpleSender};
+use tokio::sync::oneshot;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -35,7 +36,7 @@ pub struct BatchMaker {
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
-    rx_transaction: Receiver<Transaction>,
+    rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
@@ -44,6 +45,7 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
     current_batch: Batch,
+    current_batch_waiters: Vec<oneshot::Sender<()>>,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
@@ -54,7 +56,7 @@ impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
-        rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler 
+        rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>, //receiver channel from worker.TxReceiverHandler 
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -68,6 +70,7 @@ impl BatchMaker {
                 tx_batch,  
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
+                current_batch_waiters: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: SimpleSender::new(),
             }
@@ -86,8 +89,9 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    self.current_batch_size += transaction.len();
-                    self.current_batch.push(transaction);
+                    self.current_batch_size += transaction.0.len();
+                    self.current_batch.push(transaction.0);
+                    self.current_batch_waiters.push(transaction.1);
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
 
@@ -166,6 +170,11 @@ impl BatchMaker {
         self.network.broadcast(addresses, bytes).await; 
 
         self.tx_batch.send(serialized).await.expect("Failed to deliver batch");
+
+        // Reply to all waiting clients.
+        for tx in self.current_batch_waiters.drain(..) {
+            let _ = tx.send(());
+        }
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.

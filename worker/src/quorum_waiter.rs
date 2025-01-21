@@ -82,6 +82,9 @@ impl QuorumWaiter {
                         .send(batch)
                         .await
                         .expect("Failed to deliver batch");
+
+
+                    // TODO: Reply to clients.
                     break;
                 }
             }
