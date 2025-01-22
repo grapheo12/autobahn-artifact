@@ -61,6 +61,8 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Height),
+    /// Ack that some worker batch is committed
+    CommitAck(Digest),
 }
 
 /// The messages sent by the workers to their primary.
@@ -208,7 +210,7 @@ impl Primary {
             parameters.asynchrony_duration,
         );
 
-        Committer::spawn(committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
+        Committer::spawn(name, committee.clone(), store.clone(), parameters.gc_depth, rx_mempool, rx_committer, rx_commit, tx_output, synchronizer);
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
         GarbageCollector::spawn(

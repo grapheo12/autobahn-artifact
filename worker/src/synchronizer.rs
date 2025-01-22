@@ -5,7 +5,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, info};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
@@ -48,6 +48,8 @@ pub struct Synchronizer {
     /// processing will resume when we get the missing batches in the store or we no longer need them.
     /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
+
+    tx_batch_commit: Sender<Digest>,
 }
 
 impl Synchronizer {
@@ -61,6 +63,7 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        tx_batch_commit: Sender<Digest>
     ) {
         tokio::spawn(async move {
             Self {
@@ -75,6 +78,7 @@ impl Synchronizer {
                 network: SimpleSender::new(),
                 round: Round::default(),
                 pending: HashMap::new(),
+                tx_batch_commit
             }
             .run()
             .await;
@@ -173,6 +177,10 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
+                    },
+                    PrimaryWorkerMessage::CommitAck(digest) => {
+                        info!("Got Commit ack for {}", digest);
+                        let _ = self.tx_batch_commit.send(digest).await;
                     }
                 },
 

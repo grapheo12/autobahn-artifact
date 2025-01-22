@@ -74,8 +74,10 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();                         //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone());   //spawns async task that listens for network messages from Client
+        let (tx_batch_commit, rx_batch_commit) = channel(CHANNEL_CAPACITY);
+
+        worker.handle_primary_messages(tx_batch_commit);                         //spawns async task that listens for network message from Primary
+        worker.handle_clients_transactions(tx_primary.clone(), rx_batch_commit);   //spawns async task that listens for network messages from Client
         worker.handle_workers_messages(tx_primary);               //spawns async task that listens for network messages from other Workers
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -105,7 +107,7 @@ impl Worker {
 
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, tx_batch_commit: Sender<Digest>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and Synchronizer
 
         // Receive incoming messages from our primary.
@@ -131,7 +133,8 @@ impl Worker {
             self.parameters.gc_depth,
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
-            /* rx_message */ rx_synchronizer,   
+            /* rx_message */ rx_synchronizer,
+            tx_batch_commit   
         );
 
         info!(
@@ -141,13 +144,12 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
+    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>, rx_batch_commit: tokio::sync::mpsc::Receiver<Digest>) {  //tx_primary: channel between processor and PrimaryConnector
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
         //let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
         
         // To get information about committed batch hashes, this will be used to reply back to the clients.
-        let (tx_batch_commit, rx_batch_commit) = channel(CHANNEL_CAPACITY);
         // We first receive clients' transactions from the network.
         let mut address = self
             .committee
@@ -195,7 +197,6 @@ impl Worker {
             /* rx_batch */ rx_processor,  //receiver channel to connect to quorum waiter
             /* tx_digest */ tx_primary,   //sender channel to connect to PrimaryConnector
             /* own_batch */ true,
-            tx_batch_commit
         );
 
         info!(
@@ -235,7 +236,6 @@ impl Worker {
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
         // batch's digest to the `PrimaryConnector` that will send it to our primary.
-        let (tx_batch_commit, _rx_batch_commit) = channel(CHANNEL_CAPACITY);
 
         Processor::spawn(
             self.id,
@@ -243,7 +243,6 @@ impl Worker {
             /* rx_batch */ rx_processor,   //receiver channel to connect to WorkerReceiverHandler
             /* tx_digest */ tx_primary,    //sender channel to connect to PrimaryConnector
             /* own_batch */ false,
-            tx_batch_commit // this is not used here.
         );
 
         info!(
@@ -261,6 +260,7 @@ impl Worker {
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<(Transaction, oneshot::Sender<()>)>,  //sender channel to connect to batch maker
+    
 }
 
 #[async_trait]

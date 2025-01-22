@@ -4,23 +4,18 @@
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
-#[cfg(feature = "benchmark")]
-use crypto::Digest;
-use crypto::{Hash, PublicKey};
-use ed25519_dalek::{Digest, Sha512};
-#[cfg(feature = "benchmark")]
+use crypto::{Digest, Hash, PublicKey};
 use ed25519_dalek::{Digest as _, Sha512};
-use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
+// #[cfg(feature = "benchmark")]
+// use ed25519_dalek::{Digest as _, Sha512};
+use log::{debug, info};
 use network::{ReliableSender, SimpleSender};
 use tokio::sync::oneshot;
 use std::collections::HashMap;
-#[cfg(feature = "benchmark")]
-use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use std::convert::TryInto;
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -40,7 +35,7 @@ pub struct BatchMaker {
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>,
 
-    rx_batch_commit: Receiver<Vec<u8>>,
+    rx_batch_commit: Receiver<Digest>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
@@ -50,7 +45,7 @@ pub struct BatchMaker {
     /// Holds the current batch.
     current_batch: Batch,
     current_batch_waiters: Vec<oneshot::Sender<()>>,
-    all_batch_waiters: HashMap<Vec<u8>, Vec<oneshot::Sender<()>>>, // batch hash => vec of waiting chans
+    all_batch_waiters: HashMap<Digest, Vec<oneshot::Sender<()>>>, // batch hash => vec of waiting chans
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
@@ -65,7 +60,7 @@ impl BatchMaker {
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
-        rx_batch_commit: Receiver<Vec<u8>>,
+        rx_batch_commit: Receiver<Digest>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -111,6 +106,7 @@ impl BatchMaker {
                 },
 
                 Some(digest) = self.rx_batch_commit.recv() => {
+                    info!("Batch worker got {}", digest);
                     self.reply_all(digest).await;
                 }
 
@@ -131,11 +127,14 @@ impl BatchMaker {
         }
     }
 
-    async fn reply_all(&mut self, digest: Vec<u8>) {
+    async fn reply_all(&mut self, digest: Digest) {
         if let Some(waiters) = self.all_batch_waiters.remove(&digest) {
+            info!("Replying to {} waiters", waiters.len());
             for tx in waiters {
                 let _ = tx.send(());
             }
+        } else {
+            info!("Missing batch: {}", digest);
         }
     }
 
@@ -189,13 +188,15 @@ impl BatchMaker {
         let bytes = Bytes::from(serialized.clone());
         self.network.broadcast(addresses, bytes).await; 
 
-        let digest =
-            Sha512::digest(&serialized).to_vec();
+        let digest = Digest(
+            Sha512::digest(&serialized).as_slice()[..32].try_into().unwrap()
+        );
 
         self.tx_batch.send(serialized).await.expect("Failed to deliver batch");
 
         // Store all 
         let waiters = self.current_batch_waiters.drain(..).collect();
+        info!("Inserting {}", digest);
         self.all_batch_waiters.insert(digest, waiters);
 
         //OLD:

@@ -4,12 +4,13 @@
 use crate::messages::ConsensusMessage;
 use crate::primary::{Slot, CHANNEL_CAPACITY};
 use crate::synchronizer::Synchronizer;
-use crate::{Certificate, Header, Height};
+use crate::{Certificate, Header, Height, PrimaryWorkerMessage};
 //use crate::error::{ConsensusError, ConsensusResult};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info};
+use network::SimpleSender;
 use std::borrow::BorrowMut;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +72,7 @@ impl State {
 }
 
 pub struct Committer {
+    name: PublicKey,
     gc_depth: Height,
     rx_mempool: Receiver<Certificate>,
     rx_deliver: Receiver<Certificate>,
@@ -78,10 +80,13 @@ pub struct Committer {
     tx_output: Sender<Header>,
     synchronizer: Synchronizer,
     genesis: Vec<Certificate>,
+    network: SimpleSender,
+    committee: Committee,
 }
 
 impl Committer {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         gc_depth: Height,
@@ -101,6 +106,7 @@ impl Committer {
 
         tokio::spawn(async move {
             Self {
+                name,
                 gc_depth,
                 rx_mempool,
                 rx_deliver,
@@ -108,6 +114,8 @@ impl Committer {
                 tx_output,
                 synchronizer,
                 genesis,
+                committee: committee.clone(),
+                network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -161,6 +169,16 @@ impl Committer {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
                                     debug!("Finish upcall");
+
+
+                                    for (digest, id) in header.payload.iter() {
+                                        let msg = PrimaryWorkerMessage::CommitAck(digest.clone());
+                                        let bytes = bincode::serialize(&msg).expect("Could not serialize msg");
+                                        let addr = self.committee.worker(&self.name, id).expect("This worker should exist").primary_to_worker;
+                                        
+                                        info!("Sending {:?} to {:?}", msg, addr);
+                                        self.network.send(addr, bytes.into()).await;
+                                    }
                                 }
                             }
                             state.last_executed_slot += 1;
