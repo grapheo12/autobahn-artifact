@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -113,17 +114,17 @@ impl Client {
         info!("Start sending transactions");
 
         'main: loop {
-            // interval.as_mut().tick().await;
+            let mut waiting_txs = HashMap::new();
             let now = Instant::now();
-
             for x in 0..burst {
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter | (r << 32));
+                    info!("Sending sample transaction {}", (counter as u64) | (r << 32));
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter | (r << 32)); // This counter identifies the tx.
+                    tx.put_u64((counter as u64) | (r << 32)); // This counter identifies the tx.
                     r += 1;
+                    waiting_txs.insert(x, Instant::now());
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
@@ -140,10 +141,14 @@ impl Client {
 
             }
 
-            for _ in 0..burst {
+            for x in 0..burst {
                 if let None = transport_receiver.next().await {
                     warn!("Failed to receive transaction ack");
                     break 'main;
+                }
+                if let Some(start_time) = waiting_txs.remove(&x) {
+                    let duration = start_time.elapsed();
+                    info!("Client latency: {} ms", duration.as_millis());
                 }
             }
 

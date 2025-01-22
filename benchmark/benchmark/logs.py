@@ -4,7 +4,7 @@ from glob import glob
 from multiprocessing import Pool
 from os.path import join
 from re import findall, search
-from statistics import mean
+from statistics import mean, median
 
 from benchmark.utils import Print
 
@@ -34,7 +34,7 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples \
+        self.size, self.rate, self.start, misses, self.sent_samples, self.client_latencies \
             = zip(*results)
         self.misses = sum(misses)
 
@@ -92,7 +92,10 @@ class LogParser:
         tmp = findall(r'\[(.*Z) .* sample transaction (\d+)', log)
         samples = {int(s): self._to_posix(t) for t, s in tmp}
 
-        return size, rate, start, misses, samples
+        tmp = findall(r'Client latency: (\d+) ms', log)
+        client_latencies = [int(x) for x in tmp]
+
+        return size, rate, start, misses, samples, client_latencies
 
     def _parse_primaries(self, log):
         if search(r'(?:panicked|Error)', log) is not None:
@@ -220,6 +223,11 @@ class LogParser:
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
+        client_latencies = []
+        for c in self.client_latencies:
+            client_latencies.extend(c)
+        client_latency = median(client_latencies)
+
         return (
             '\n'
             '-----------------------------------------\n'
@@ -251,6 +259,8 @@ class LogParser:
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            '\n'
+            f' Client latency: {round(client_latency):,} ms\n'
             '-----------------------------------------\n'
         )
 
