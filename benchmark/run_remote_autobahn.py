@@ -179,18 +179,15 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
     # The rate will be divided among client VMs and then within VMs to each of the client binaries.
-    rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    clients_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
     # rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
         for i, addresses in enumerate(node_addrs):
-            _rate = 1000
-            if True or (i == 0):
-                _rate = rate_per_vm
             for (id, addr) in addresses:
                 cmd = CommandMaker.run_client(
-                    addr, bench_params['tx_size'], _rate,
+                    addr, bench_params['tx_size'], clients_per_vm,
                     [x for y in node_addrs for _, x in y],
                     binary_name="./target/release/benchmark_client"
                 )
@@ -274,7 +271,7 @@ def copy_logs(node_conns, client_conns, repeat_num, wd, controller_conn=None, co
                 copy_log(f"client-{client}-{i}-{id}", conn, repeat_num, wd)
 
 
-def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
+def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, num_clients=None):
     # build_project()
     git_hash = get_current_git_hash()
     # gen_config("configs", "cluster", node_template, client_template, ip_list, -1)
@@ -314,9 +311,9 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
 
     for i in range(repeat):
         print("Experiment sequence num:", i)
-        if not(rates is None):
-            assert len(rates) == repeat
-            bench_params["rate"] = [rates[i]]
+        if not(num_clients is None):
+            assert len(num_clients) == repeat
+            bench_params["rate"] = [num_clients[i]]
 
         print("Running Nodes")
         promises = []
@@ -402,18 +399,18 @@ def run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=None):
     type=click.INT
 )
 @click.option(
-    "-rate", "--rates",
+    "-c", "--clients",
     default=[], multiple=True,
     type=click.INT,
     help="Rates to be used for the runs"
 )
-def main(num_nodes, ip_list, identity_file, repeat, seconds, rates):
-    rates = list(rates)
-    if len(rates) == 0:
-        rates = None
-    elif len(rates) == 1 and repeat > 1:
-        rates = [rates[0]] * repeat
-    run_remote(num_nodes, ip_list, identity_file, repeat, seconds, rates=rates)
+def main(num_nodes, ip_list, identity_file, repeat, seconds, clients):
+    clients = list(clients)
+    if len(clients) == 0:
+        clients = None
+    elif len(clients) == 1 and repeat > 1:
+        clients = [clients[0]] * repeat
+    run_remote(num_nodes, ip_list, identity_file, repeat, seconds, num_clients=clients)
 
     
     

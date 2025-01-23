@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         .about("Benchmark client for Sailfish.")
         .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
-        .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
+        .args_from_usage("--clients=<INT> 'Number of clients'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .context("The size of transactions must be a non-negative integer")?;
-    let rate = matches
-        .value_of("rate")
+    let clients = matches
+        .value_of("clients")
         .unwrap()
         .parse::<u64>()
         .context("The rate of transactions must be a non-negative integer")?;
@@ -63,11 +63,14 @@ async fn main() -> Result<()> {
     info!("Transactions size: {} B", size);
 
     // NOTE: This log entry is used to compute performance.
+    let rate = 200_000;
     info!("Transactions rate: {} tx/s", rate);
+
+    info!("Number of clients: {}", clients);
 
     
     let mut futs = FuturesUnordered::new();
-    for _ in 0..300 {
+    for _ in 0..clients {
         let _nodes = nodes.iter().map(|e| e.clone()).collect::<Vec<_>>();
         futs.push(async move {
             let client = Arc::new(Box::pin(Client {
@@ -84,7 +87,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    for _ in 0..1000 {
+    for _ in 0..clients {
         futs.next().await;
     }
 
