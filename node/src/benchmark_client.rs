@@ -1,11 +1,13 @@
+use anyhow::Ok;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
+use bytes::{Buf, BufMut as _};
 use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
 use env_logger::Env;
 use futures::future::join_all;
 use futures::sink::SinkExt as _;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use log::{info, warn};
 use rand::Rng;
@@ -14,6 +16,7 @@ use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,18 +65,30 @@ async fn main() -> Result<()> {
     // NOTE: This log entry is used to compute performance.
     info!("Transactions rate: {} tx/s", rate);
 
-    let client = Client {
-        target,
-        size,
-        rate,
-        nodes,
-    };
+    
+    let mut futs = FuturesUnordered::new();
+    for _ in 0..300 {
+        let _nodes = nodes.iter().map(|e| e.clone()).collect::<Vec<_>>();
+        futs.push(async move {
+            let client = Arc::new(Box::pin(Client {
+                target,
+                size,
+                rate,
+                nodes: _nodes,
+            }));
+            
+            // Wait for all nodes to be online and synchronized.
+            client.wait().await;
+            // Start the benchmark.
+            client.send().await;
+        });
+    }
 
-    // Wait for all nodes to be online and synchronized.
-    client.wait().await;
+    for _ in 0..1000 {
+        futs.next().await;
+    }
 
-    // Start the benchmark.
-    client.send().await.context("Failed to submit transactions")
+    Ok(())
 }
 
 struct Client {
@@ -114,19 +129,16 @@ impl Client {
         info!("Start sending transactions");
 
         'main: loop {
-            let mut waiting_txs = HashMap::new();
             let now = Instant::now();
             for x in 0..burst {
+                let start_time = Instant::now();
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", (counter as u64) | (r << 32));
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64((counter as u64) | (r << 32)); // This counter identifies the tx.
-                    r += 1;
-                    waiting_txs.insert(x, Instant::now());
                 } else {
-                    r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
                 };
@@ -139,18 +151,32 @@ impl Client {
                     break 'main;
                 }
 
-            }
-
-            for x in 0..burst {
-                if let None = transport_receiver.next().await {
-                    warn!("Failed to receive transaction ack");
-                    break 'main;
+                match transport_receiver.next().await {
+                    Some(Result::Ok(mut resp)) => {
+                        if x == counter % burst {
+                            assert!(resp.get_u8() == 0u8);
+                            assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                        } else {
+                            assert!(resp.get_u8() == 1u8);
+                            assert!(resp.get_u64() == r);
+                        }
+                    },
+                    _ => {
+                        warn!("Failed to receive transaction ack");
+                        break 'main;
+                    }
                 }
-                if let Some(start_time) = waiting_txs.remove(&x) {
+                if x == counter % burst {
                     let duration = start_time.elapsed();
                     info!("Client latency: {} ms", duration.as_millis());
                 }
+
+
+                r += 1;
             }
+
+            // for x in 0..burst {
+            // }
 
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
                 // NOTE: This log entry is used to compute performance.

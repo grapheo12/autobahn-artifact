@@ -8,7 +8,7 @@ use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
@@ -268,6 +268,11 @@ impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         let (tx, rx) = oneshot::channel();
         // Send the transaction to the batch maker.
+        let mut ack = BytesMut::new();
+        let mut _m = message.clone();
+        ack.put_u8(_m.get_u8());
+        ack.put_u64(_m.get_u64());
+        
         self.tx_batch_maker
             .send((message.to_vec(), tx))
             .await
@@ -276,7 +281,7 @@ impl MessageHandler for TxReceiverHandler {
         // Give the change to schedule other tasks.
         // tokio::task::yield_now().await;
         let _ = rx.await;
-        let _ = _writer.send(Bytes::from("Ack")).await;
+        let _ = _writer.send(ack.into()).await;
 
         Ok(())
     }

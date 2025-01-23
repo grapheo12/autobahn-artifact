@@ -85,8 +85,8 @@ def get_default_node_params(num_nodes, repeats, seconds):
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 5_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
-        'batch_size':  (512 * 500),# 500_000,  # bytes
-        'max_batch_delay': 5,  # ms
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 2,  # ms
         'use_optimistic_tips': True,
         'use_parallel_proposals': True,
         'k': 4,

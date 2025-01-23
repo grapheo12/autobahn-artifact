@@ -1511,7 +1511,7 @@ impl Core {
             .filter(|(pk, proposal)| proposal.height > prepare_proposals.get(&pk).unwrap().height)
             .collect();
 
-        new_tips.len() as u32 >= 1 //  self.committee.quorum_threshold()
+        new_tips.len() as u32 >= self.committee.quorum_threshold()
     }
 
     #[async_recursion]
