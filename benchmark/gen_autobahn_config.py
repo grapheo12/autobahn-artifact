@@ -81,12 +81,12 @@ def get_default_node_params(num_nodes, repeats, seconds):
     node_params = {
         'timeout_delay': 5_000,  # ms
         'header_size': 32,  # bytes
-        'max_header_delay': 5_000,  # ms
+        'max_header_delay': 20, # 5_000,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 5_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 2,  # ms
+        'max_batch_delay': 20,  # ms
         'use_optimistic_tips': True,
         'use_parallel_proposals': True,
         'k': 4,

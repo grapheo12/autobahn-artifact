@@ -179,12 +179,15 @@ def run_clients(client_conns: Dict[str, Connection], repeat_num: int, wd: str, n
 
     # In each client VM, there will be `num_nodes` benchmark_clients, each sending transactions to one nodes
     # The rate will be divided among client VMs and then within VMs to each of the client binaries.
-    clients_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    # clients_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()) / num_nodes)
+    clients_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
     # rate_per_vm = ceil(bench_params['rate'][0] / len(client_conns.keys()))
     node_addrs = committee.workers_addresses(0)
     
     for client, conn in client_conns.items():
         for i, addresses in enumerate(node_addrs):
+            if i != 0:
+                break
             for (id, addr) in addresses:
                 cmd = CommandMaker.run_client(
                     addr, bench_params['tx_size'], clients_per_vm,

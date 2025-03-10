@@ -145,7 +145,9 @@ impl Client {
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
                 };
-
+                // while self.size > tx.len() {
+                //     tx.put_u8(rand::random());
+                // }
                 tx.resize(self.size, 0u8); //Truncate any bits past size
                 let bytes = tx.split().freeze(); //split() moves byte content from tx to bytes (i.e. avoids copy). freeze() makes it const so it can be shared. (bytes can now be used/sent async)
                 //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
@@ -163,6 +165,7 @@ impl Client {
                             assert!(resp.get_u8() == 1u8);
                             assert!(resp.get_u64() == r);
                         }
+                        assert!(resp.get_u64() == 0xdeadbeef);
                     },
                     _ => {
                         warn!("Failed to receive transaction ack");

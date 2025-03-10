@@ -270,8 +270,15 @@ impl MessageHandler for TxReceiverHandler {
         // Send the transaction to the batch maker.
         let mut ack = BytesMut::new();
         let mut _m = message.clone();
-        ack.put_u8(_m.get_u8());
-        ack.put_u64(_m.get_u64());
+        let sample_or_not = _m.get_u8();
+        let id = _m.get_u64();
+        ack.put_u8(sample_or_not);
+        ack.put_u64(id);
+        ack.put_u64(0xdeadbeef);
+
+        if sample_or_not == 0u8 {
+            info!("Sending to batch maker {}", id);
+        }
         
         self.tx_batch_maker
             .send((message.to_vec(), tx))
@@ -280,7 +287,11 @@ impl MessageHandler for TxReceiverHandler {
 
         // Give the change to schedule other tasks.
         // tokio::task::yield_now().await;
-        let _ = rx.await;
+        rx.await.expect("Failed to receive response");
+
+        if sample_or_not == 0u8 {
+            info!("Got response for {}", id);
+        }
         let _ = _writer.send(ack.into()).await;
 
         Ok(())

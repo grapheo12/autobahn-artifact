@@ -5,7 +5,7 @@ from multiprocessing import Pool
 from os.path import join
 from re import findall, search
 from statistics import mean, median
-
+from collections import defaultdict
 from benchmark.utils import Print
 
 
@@ -34,8 +34,14 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples, self.client_latencies \
+        self.size, self.rate, self.start, misses, self.sent_samples, self.client_latencies, worker_ips \
             = zip(*results)
+
+        ip_sent_map = defaultdict(dict)
+        for sent, ip in zip(self.sent_samples, worker_ips):
+            ip_sent_map[ip].update(sent)
+        
+
         self.misses = sum(misses)
 
         # Parse the primaries logs.
@@ -59,6 +65,9 @@ class LogParser:
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
 
+        self.sent_samples = [ip_sent_map[ip] for ip in workers_ips]
+
+
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
 
@@ -80,6 +89,8 @@ class LogParser:
     def _parse_clients(self, log):
         if search(r'Error', log) is not None:
             raise ParseError('Client(s) panicked')
+        
+        worker_ip = str(search(r'Node address: ([0-9.]+)', log).group(1))
 
         size = int(search(r'Transactions size: (\d+)', log).group(1))
         rate = int(search(r'Transactions rate: (\d+)', log).group(1))
@@ -95,18 +106,22 @@ class LogParser:
         tmp = findall(r'Client latency: (\d+) ms', log)
         client_latencies = [int(x) for x in tmp]
 
-        return size, rate, start, misses, samples, client_latencies
+        return size, rate, start, misses, samples, client_latencies, worker_ip
 
     def _parse_primaries(self, log):
         if search(r'(?:panicked|Error)', log) is not None:
             raise ParseError('Primary(s) panicked')
-
-        tmp = findall(r'\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        
+        tmp = findall(r'Primary ([^ ]+) successfully booted on.*', log)
+        if len(tmp) != 1:
+            raise ParseError("Primary has no identity")
+        primary_id = tmp[0]
+        tmp = findall(r'\[(.*Z) .* Created B\d+\(([^ ]+)\) -> ([^ ]+=)', log)
+        tmp = [(d, self._to_posix(t)) for t, pid, d in tmp if pid == primary_id]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        tmp = findall(r'\[(.*Z) .* Committed B\d+\(([^ ]+)\) -> ([^ ]+=)', log) 
+        tmp = [(d, self._to_posix(t)) for t, pid, d in tmp if pid == primary_id]
         commits = self._merge_results([tmp])
 
         configs = {
@@ -166,6 +181,7 @@ class LogParser:
         bytes = sum(self.sizes.values())
         bps = bytes / duration
         tps = bps / self.size[0]
+        # tps = len(self.sizes.values()) / duration
         return tps, bps, duration
 
     def _consensus_latency(self):
@@ -187,20 +203,20 @@ class LogParser:
         list_latencies = []
         first_start = 0
         set_first = True
-        for received in self.received_samples:
+        print(len(self.received_samples), len(self.sent_samples))
+        for sent, received in zip(self.sent_samples, self.received_samples):
             for tx_id, batch_id in received.items():
                 if batch_id in self.commits:
-                    # assert tx_id in sent  # We receive txs that we sent.
-                    for _sent in self.sent_samples:
-                        if tx_id in _sent:
-                            start = _sent[tx_id]
-                            end = self.commits[batch_id]
-                            if set_first:
-                                first_start = start
-                                first_end = end
-                                set_first = False
-                            latency += [end-start]
-                            list_latencies += [(start-first_start, end-first_start, end-start)]
+                    assert tx_id in sent  # We receive txs that we sent.
+                    start = sent[tx_id]
+                    end = self.commits[batch_id]
+                    print(tx_id, batch_id, start, end, end - start)
+                    if set_first:
+                        first_start = start
+                        first_end = end
+                        set_first = False
+                    latency += [end-start]
+                    list_latencies += [(start-first_start, end-first_start, end-start)]
 
         list_latencies.sort(key=lambda tup: tup[0])
         with open('latencies.txt', 'w') as f:
@@ -226,7 +242,7 @@ class LogParser:
         client_latencies = []
         for c in self.client_latencies:
             client_latencies.extend(c)
-        client_latency = median(client_latencies)
+        client_latency = mean(client_latencies)
 
         return (
             '\n'
