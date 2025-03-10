@@ -197,7 +197,9 @@ impl BatchMaker {
         // Store all 
         let waiters = self.current_batch_waiters.drain(..).collect();
         info!("Inserting {}", digest);
-        self.all_batch_waiters.insert(digest, waiters);
+        self.all_batch_waiters.insert(digest.clone(), waiters);
+
+        // self.reply_all(digest).await;
 
         //OLD:
         //This uses reliable sender. The receiver worker will reply with an ack. The Reply Handler is passed to Quorum Waiter.
