@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -105,6 +105,7 @@ impl Client {
     pub async fn send(&self) -> Result<()> {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
+        const MAX_CONCURRENT_TXS: usize = 16;
 
         // The transaction size must be at least 16 bytes to ensure all txs are different.
         if self.size < 9 {
@@ -120,11 +121,76 @@ impl Client {
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
+        let _burst = burst;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
         let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
         let (mut transport_sender, mut transport_receiver) = transport.split();
+        let (sema_tx, mut sema_rx) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TXS);
+        let (sema_tx2, mut sema_rx2) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TXS);
+        for _ in 0..MAX_CONCURRENT_TXS {
+            sema_tx.send(true).await;
+        }
+
+        tokio::spawn(async move {
+            let mut request_store = HashMap::new();
+            let mut response_store = HashSet::new();
+            'main2: loop {
+                tokio::select! {
+                    req = sema_rx2.recv() => {
+                        if let Some((x, counter, r, start_time)) = req {
+                            if x == counter % _burst {
+                                request_store.insert((x, counter, r), start_time);
+                            }
+                        }
+                    },
+
+                    resp = transport_receiver.next() => {
+                        if let Some(Result::Ok(mut resp)) = resp {
+                            let tag = resp.get_u8();
+                            let id = resp.get_u64();
+                            let x = resp.get_u64();
+
+                            if tag == 0u8 {
+                                let counter = id & ((1 << 32) - 1);
+                                let r = id >> 32;
+
+                                response_store.insert((x, counter, r));
+                            }
+                            // if x == counter % burst {
+                            //     assert!(resp.get_u8() == 0u8);
+                            //     assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                            // } else {
+                            //     assert!(resp.get_u8() == 1u8);
+                            //     assert!(resp.get_u64() == r);
+                            // }
+                            assert!(resp.get_u64() == 0xdeadbeef);
+
+                            sema_tx.send(true).await;
+                        } else {
+                            warn!("Failed to receive transaction ack");
+                            break 'main2;
+                        }
+                    }
+
+                }
+
+                let mut to_remove = vec![];
+                for (x, counter, r) in request_store.keys() {
+                    if response_store.contains(&(*x, *counter, *r)) {
+                        to_remove.push((*x, *counter, *r));
+                    }
+                }
+
+                for (x, counter, r) in to_remove {
+                    let start_time: Instant = request_store.remove(&(x, counter, r)).unwrap();
+                    let duration: Duration = start_time.elapsed();
+                    info!("Client latency: {} ms", duration.as_millis());
+                    response_store.remove(&(x, counter, r));
+                }
+            }
+        });
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
 
@@ -134,6 +200,7 @@ impl Client {
         'main: loop {
             let now = Instant::now();
             for x in 0..burst {
+                let _ = sema_rx.recv().await;
                 let start_time = Instant::now();
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
@@ -141,9 +208,11 @@ impl Client {
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64((counter as u64) | (r << 32)); // This counter identifies the tx.
+                    tx.put_u64(x);
                 } else {
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
+                    tx.put_u64(x);
                 };
                 // while self.size > tx.len() {
                 //     tx.put_u8(rand::random());
@@ -156,26 +225,28 @@ impl Client {
                     break 'main;
                 }
 
-                match transport_receiver.next().await {
-                    Some(Result::Ok(mut resp)) => {
-                        if x == counter % burst {
-                            assert!(resp.get_u8() == 0u8);
-                            assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
-                        } else {
-                            assert!(resp.get_u8() == 1u8);
-                            assert!(resp.get_u64() == r);
-                        }
-                        assert!(resp.get_u64() == 0xdeadbeef);
-                    },
-                    _ => {
-                        warn!("Failed to receive transaction ack");
-                        break 'main;
-                    }
-                }
-                if x == counter % burst {
-                    let duration = start_time.elapsed();
-                    info!("Client latency: {} ms", duration.as_millis());
-                }
+                sema_tx2.send((x, counter, r, start_time)).await;
+
+                // match transport_receiver.next().await {
+                //     Some(Result::Ok(mut resp)) => {
+                //         if x == counter % burst {
+                //             assert!(resp.get_u8() == 0u8);
+                //             assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                //         } else {
+                //             assert!(resp.get_u8() == 1u8);
+                //             assert!(resp.get_u64() == r);
+                //         }
+                //         assert!(resp.get_u64() == 0xdeadbeef);
+                //     },
+                //     _ => {
+                //         warn!("Failed to receive transaction ack");
+                //         break 'main;
+                //     }
+                // }
+                // if x == counter % burst {
+                //     let duration = start_time.elapsed();
+                //     info!("Client latency: {} ms", duration.as_millis());
+                // }
 
 
                 r += 1;
