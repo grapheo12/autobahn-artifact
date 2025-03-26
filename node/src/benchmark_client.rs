@@ -141,6 +141,7 @@ impl Client {
                     req = sema_rx2.recv() => {
                         if let Some((x, counter, r, start_time)) = req {
                             if x == counter % _burst {
+                                println!("Inserting sample transaction {}", (counter as u64) | (r << 32));
                                 request_store.insert((x, counter, r), start_time);
                             }
                         }
@@ -155,6 +156,9 @@ impl Client {
                             if tag == 0u8 {
                                 let counter = id & ((1 << 32) - 1);
                                 let r = id >> 32;
+
+                                assert!(x == counter % _burst);
+                                println!("Received sample transaction {}", id);
 
                                 response_store.insert((x, counter, r));
                             }
