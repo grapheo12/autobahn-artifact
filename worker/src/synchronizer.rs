@@ -133,6 +133,7 @@ impl Synchronizer {
                                 },
                                 Ok(Some(_)) => {
                                     // The batch arrived in the meantime: no need to request it.
+                                    debug!("Batch {} is already in store", digest);
                                 },
                                 Err(e) => {
                                     error!("{}", e);

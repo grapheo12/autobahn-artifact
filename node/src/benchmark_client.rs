@@ -136,14 +136,18 @@ impl Client {
         tokio::spawn(async move {
             let mut request_store = HashMap::new();
             let mut response_store = HashSet::new();
+            let mut total_latency = Duration::new(0, 0);
+            let mut latency_count = 0;
+            let mut log_interval = interval(Duration::from_secs(1));
             'main2: loop {
                 tokio::select! {
                     req = sema_rx2.recv() => {
-                        if let Some((x, counter, r, start_time)) = req {
-                            if x == counter % _burst {
-                                println!("Inserting sample transaction {}", (counter as u64) | (r << 32));
+                        if let Some((x, counter, mut r, start_time)) = req {
+                            // if x == counter % _burst {
+                            //     r = r & ((1 << 32) - 1);
+                                // println!("Inserting sample transaction {} {} {} {}", (counter as u64) | (r << 32), x, counter, r);
                                 request_store.insert((x, counter, r), start_time);
-                            }
+                            // }
                         }
                     },
 
@@ -152,16 +156,18 @@ impl Client {
                             let tag = resp.get_u8();
                             let id = resp.get_u64();
                             let x = resp.get_u64();
+                            let counter = resp.get_u64();
+                            let r = resp.get_u64();
 
-                            if tag == 0u8 {
-                                let counter = id & ((1 << 32) - 1);
-                                let r = id >> 32;
+                            // if tag == 0u8 {
+                                // let counter = id & ((1 << 32) - 1);
+                                // let r = id >> 32;
 
-                                assert!(x == counter % _burst);
-                                println!("Received sample transaction {}", id);
+                                // assert!(x == counter % _burst);
+                                // println!("Received sample transaction {} {} {} {}", id, x, counter, r);
 
                                 response_store.insert((x, counter, r));
-                            }
+                            // }
                             // if x == counter % burst {
                             //     assert!(resp.get_u8() == 0u8);
                             //     assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
@@ -176,13 +182,23 @@ impl Client {
                             warn!("Failed to receive transaction ack");
                             break 'main2;
                         }
+                    },
+
+                    _ = log_interval.tick() => {
+                        if latency_count > 0 {
+                            let avg_latency = total_latency / latency_count;
+                            // Print average over a 1s window.
+                            info!("Client latency: {} ms", avg_latency.as_millis());
+                            latency_count = 0;
+                            total_latency = Duration::new(0, 0);
+                        }
                     }
 
                 }
 
                 let mut to_remove = vec![];
-                for (x, counter, r) in request_store.keys() {
-                    if response_store.contains(&(*x, *counter, *r)) {
+                for (x, counter, r) in response_store.iter() {
+                    if request_store.contains_key(&(*x, *counter, *r)) {
                         to_remove.push((*x, *counter, *r));
                     }
                 }
@@ -190,8 +206,11 @@ impl Client {
                 for (x, counter, r) in to_remove {
                     let start_time: Instant = request_store.remove(&(x, counter, r)).unwrap();
                     let duration: Duration = start_time.elapsed();
-                    info!("Client latency: {} ms", duration.as_millis());
                     response_store.remove(&(x, counter, r));
+
+                    total_latency += duration;
+                    latency_count += 1;
+
                 }
             }
         });
@@ -213,10 +232,14 @@ impl Client {
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64((counter as u64) | (r << 32)); // This counter identifies the tx.
                     tx.put_u64(x);
+                    tx.put_u64(counter);
+                    tx.put_u64(r);
                 } else {
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
                     tx.put_u64(x);
+                    tx.put_u64(counter);
+                    tx.put_u64(r);
                 };
                 // while self.size > tx.len() {
                 //     tx.put_u8(rand::random());

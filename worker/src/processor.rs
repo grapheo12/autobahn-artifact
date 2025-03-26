@@ -8,6 +8,7 @@ use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use log::debug;
 
 #[cfg(test)]
 #[path = "tests/processor_tests.rs"]
@@ -40,6 +41,7 @@ impl Processor {
                 // Store the batch.
                 store.write(digest.to_vec(), batch).await;
                 //store.write(digest.to_vec(), Vec::default()).await;
+                debug!("Stored batch with digest: {:?}", digest);
 
                 // Deliver the batch's digest.
                 let message = match own_digest {

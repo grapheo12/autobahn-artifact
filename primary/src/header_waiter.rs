@@ -184,6 +184,7 @@ impl HeaderWaiter {
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (round, tx_cancel));
+                            debug!("Force sync for header {:?} is {}", header, force_sync);
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 

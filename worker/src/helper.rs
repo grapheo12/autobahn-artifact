@@ -2,7 +2,7 @@
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use log::{error, warn};
+use log::{error, warn, debug};
 use network::SimpleSender;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
@@ -61,8 +61,14 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
-                    Ok(None) => (),
+                    Ok(Some(data)) => { 
+                        debug!("Sending batch {} to {}", digest, origin);
+                        self.network.send(address, Bytes::from(data)).await; 
+                    },
+                    Ok(None) => {
+                        warn!("Batch {} not found", digest);
+                        ()
+                    },
                     Err(e) => error!("{}", e),
                 }
             }

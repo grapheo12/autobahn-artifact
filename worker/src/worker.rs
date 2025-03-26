@@ -273,9 +273,13 @@ impl MessageHandler for TxReceiverHandler {
         let sample_or_not = _m.get_u8();
         let id = _m.get_u64();
         let _x = _m.get_u64();
+        let _counter = _m.get_u64();
+        let _r = _m.get_u64();
         ack.put_u8(sample_or_not);
         ack.put_u64(id);
         ack.put_u64(_x);
+        ack.put_u64(_counter);
+        ack.put_u64(_r);
         ack.put_u64(0xdeadbeef);
 
         if sample_or_not == 0u8 {
