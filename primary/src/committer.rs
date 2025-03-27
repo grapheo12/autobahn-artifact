@@ -178,6 +178,7 @@ impl Committer {
                                         
                                         info!("Sending {:?} to {:?}", msg, addr);
                                         self.network.send(addr, bytes.into()).await;
+                                        // self.network.flush().await;
                                     }
                                 }
                             }

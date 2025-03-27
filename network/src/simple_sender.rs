@@ -127,6 +127,7 @@ impl Connection {
                         warn!("{}", NetworkError::FailedToSendMessage(self.address, e));
                         return;
                     }
+                    writer.flush().await;
                 },
                 response = reader.next() => {
                     match response {
