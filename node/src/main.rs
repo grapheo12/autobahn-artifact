@@ -18,6 +18,10 @@ use worker::Worker;
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     //std::env::set_var("RUST_BACKTRACE", "1");

@@ -29,10 +29,10 @@ impl Store {
     pub fn new(path: &str) -> StoreResult<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        opts.set_write_buffer_size(67108864);
-        opts.set_max_write_buffer_number(4);
+        opts.set_write_buffer_size(2147483648);
+        opts.set_max_write_buffer_number(1);
         opts.set_min_write_buffer_number_to_merge(1);
-        opts.set_target_file_size_base(67108864 as u64);
+        opts.set_target_file_size_base(2147483648 as u64);
 
         opts.set_manual_wal_flush(true);
         opts.set_compaction_style(DBCompactionStyle::Universal);
@@ -41,7 +41,7 @@ impl Store {
 
         let db = rocksdb::DB::open(&opts, path)?;
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
-        let (tx, mut rx) = channel(100);
+        let (tx, mut rx) = channel(1000);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
                 match command {

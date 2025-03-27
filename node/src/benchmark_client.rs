@@ -18,6 +18,10 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
