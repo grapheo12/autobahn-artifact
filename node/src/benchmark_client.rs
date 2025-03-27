@@ -137,7 +137,11 @@ impl Client {
             let mut request_store = HashMap::new();
             let mut response_store = HashSet::new();
             let mut total_latency = Duration::new(0, 0);
+            let mut min_latency = Duration::new(u64::MAX, 0);
+            let mut max_latency = Duration::new(0, 0);
+            let mut total_latency_from_sampled = Duration::new(0, 0);
             let mut latency_count = 0;
+            let mut latency_count_from_sampled = 0;
             let mut log_interval = interval(Duration::from_secs(1));
             'main2: loop {
                 tokio::select! {
@@ -192,6 +196,24 @@ impl Client {
                             latency_count = 0;
                             total_latency = Duration::new(0, 0);
                         }
+
+                        if latency_count_from_sampled > 0 {
+                            let avg_latency = total_latency_from_sampled / latency_count_from_sampled;
+                            // Print average over a 1s window.
+                            info!("Sampled client latency: {} ms", avg_latency.as_millis());
+                            latency_count_from_sampled = 0;
+                            total_latency_from_sampled = Duration::new(0, 0);
+                        }
+
+                        if min_latency != Duration::new(u64::MAX, 0) {
+                            info!("Min client latency: {} ms", min_latency.as_millis());
+                            min_latency = Duration::new(u64::MAX, 0);
+                        }
+
+                        if max_latency != Duration::new(0, 0) {
+                            info!("Max client latency: {} ms", max_latency.as_millis());
+                            max_latency = Duration::new(0, 0);
+                        }
                     }
 
                 }
@@ -211,6 +233,18 @@ impl Client {
                     total_latency += duration;
                     latency_count += 1;
 
+                    if x == counter % _burst {
+                        total_latency_from_sampled += duration;
+                        latency_count_from_sampled += 1;
+                    }
+
+                    if duration < min_latency {
+                        min_latency = duration;
+                    }
+
+                    if duration > max_latency {
+                        max_latency = duration;
+                    }
                 }
             }
         });
