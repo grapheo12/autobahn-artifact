@@ -114,12 +114,12 @@ impl BatchMaker {
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     debug!("BatchMaker: max batch delay timer triggered");
-                    if self.current_batch.is_empty() {
-                        self.current_batch.push(vec![rand::thread_rng().gen(); 128]);
-                    }
-                    // if !self.current_batch.is_empty() {
-                        self.seal().await;
+                    // if self.current_batch.is_empty() {
+                    //     self.current_batch.push(vec![rand::thread_rng().gen(); 128]);
                     // }
+                    if !self.current_batch.is_empty() {
+                        self.seal().await;
+                    }
 
                     current_time = Instant::now();
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
