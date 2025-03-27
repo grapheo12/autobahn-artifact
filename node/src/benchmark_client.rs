@@ -291,6 +291,7 @@ impl Client {
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
                 }
+                transport_sender.flush().await?;
 
                 sema_tx2.send((x, counter, r, start_time)).await;
 

@@ -131,6 +131,7 @@ impl<Handler: AsyncMessageHandler> AsyncReceiver<Handler> {
                     continue;
                 }
             };
+            socket.set_nodelay(true).unwrap();
             let transport = Framed::new(socket, LengthDelimitedCodec::new());
             let (mut writer, mut reader) = transport.split();
             let (tx, rx) = tokio::sync::mpsc::channel(1000);
@@ -169,6 +170,8 @@ impl<Handler: AsyncMessageHandler> AsyncReceiver<Handler> {
                     warn!("{}", e);
                     return;
                 }
+
+                writer.flush().await.unwrap();
             }
             warn!("Connection closed by peer {}", peer);
         });
