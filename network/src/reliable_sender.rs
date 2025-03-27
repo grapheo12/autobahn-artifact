@@ -144,6 +144,7 @@ impl Connection {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
                     info!("Outgoing connection established with {}", self.address);
+                    stream.set_nodelay(true).expect("Failed to set TCP_NODELAY");
 
                     // Reset the delay.
                     delay = self.retry_delay;

@@ -123,6 +123,8 @@ impl Client {
             .await
             .context(format!("failed to connect to {}", self.target))?;
 
+        stream.set_nodelay(true)?;
+
         // Submit all transactions.
         let burst = self.rate / PRECISION;
         let _burst = burst;
