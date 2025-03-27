@@ -13,7 +13,7 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
-use network::{MessageHandler, Receiver, Writer};
+use network::{MessageHandler, AsyncMessageHandler, Receiver, Writer, AsyncReceiver, AsyncMessageResponse};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -157,7 +157,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
+        AsyncReceiver::spawn(
             address,                                            //socket to receive Client messages from
             /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
         );
@@ -264,8 +264,8 @@ struct TxReceiverHandler {
 }
 
 #[async_trait]
-impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+impl AsyncMessageHandler for TxReceiverHandler {
+    async fn dispatch(&self, message: Bytes, resp_tx: Sender<AsyncMessageResponse>) -> Result<(), Box<dyn Error>> {
         let (tx, rx) = oneshot::channel();
         // Send the transaction to the batch maker.
         let mut ack = BytesMut::new();
@@ -291,14 +291,16 @@ impl MessageHandler for TxReceiverHandler {
             .await
             .expect("Failed to send transaction");
 
-        // Give the change to schedule other tasks.
-        // tokio::task::yield_now().await;
-        rx.await.expect("Failed to receive response");
+        resp_tx.send((ack.freeze(), rx)).await.expect("Failed to send response");
 
-        if sample_or_not == 0u8 {
-            info!("Got response for {}", id);
-        }
-        let _ = _writer.send(ack.into()).await;
+        // // Give the change to schedule other tasks.
+        // // tokio::task::yield_now().await;
+        // rx.await.expect("Failed to receive response");
+
+        // if sample_or_not == 0u8 {
+        //     info!("Got response for {}", id);
+        // }
+        // let _ = _writer.send(ack.into()).await;
 
         Ok(())
     }
