@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     info!("Transactions size: {} B", size);
 
     // NOTE: This log entry is used to compute performance.
-    let rate = 100;
+    let rate = 1000;
     info!("Transactions rate: {} tx/s", rate);
 
     info!("Number of clients: {}", clients);
