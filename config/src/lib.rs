@@ -238,9 +238,9 @@ impl Committee {
     pub fn validity_threshold(&self) -> Stake {
         // If N = 3f + 1 + k (0 <= k < 3)
         // then (N + 2) / 3 = f + 1 + k/3 = f + 1
-        // let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
-        // (total_votes + 2) / 3
-        1
+        let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
+        (total_votes + 2) / 3
+        // 1
     }
 
     pub fn fast_threshold(&self) -> Stake {

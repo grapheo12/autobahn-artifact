@@ -34,7 +34,7 @@ pub struct BatchMaker {
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
-    rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>,
+    rx_transaction: Receiver<(Transaction, oneshot::Sender<bool>)>,
 
     rx_batch_commit: Receiver<Digest>,
    
@@ -45,19 +45,21 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
     current_batch: Batch,
-    current_batch_waiters: Vec<oneshot::Sender<()>>,
-    all_batch_waiters: HashMap<Digest, Vec<oneshot::Sender<()>>>, // batch hash => vec of waiting chans
+    current_batch_waiters: Vec<oneshot::Sender<bool>>,
+    all_batch_waiters: HashMap<Digest, Vec<oneshot::Sender<bool>>>, // batch hash => vec of waiting chans
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: SimpleSender,
+
+    num_ticks_before_requests_cancelled: usize,
 }
 
 impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
-        rx_transaction: Receiver<(Transaction, oneshot::Sender<()>)>, //receiver channel from worker.TxReceiverHandler 
+        rx_transaction: Receiver<(Transaction, oneshot::Sender<bool>)>, //receiver channel from worker.TxReceiverHandler 
         //tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -76,7 +78,8 @@ impl BatchMaker {
                 all_batch_waiters: HashMap::new(),
                 current_batch_size: 0,
                 network: SimpleSender::new(),
-                rx_batch_commit
+                rx_batch_commit,
+                num_ticks_before_requests_cancelled: 0,
             }
             .run()
             .await;
@@ -121,6 +124,13 @@ impl BatchMaker {
                         self.seal().await;
                     }
 
+                    self.num_ticks_before_requests_cancelled += 1;
+
+                    if self.num_ticks_before_requests_cancelled == 1000 {
+                        self.num_ticks_before_requests_cancelled = 0;
+                        self.cancel_all_request().await;
+                    }
+
                     current_time = Instant::now();
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                 }
@@ -135,10 +145,19 @@ impl BatchMaker {
         if let Some(waiters) = self.all_batch_waiters.remove(&digest) {
             info!("Replying to {} waiters", waiters.len());
             for tx in waiters {
-                let _ = tx.send(());
+                let _ = tx.send(true);
             }
         } else {
             info!("Missing batch: {}", digest);
+        }
+    }
+
+    async fn cancel_all_request(&mut self) {
+        for (digest, waiters) in self.all_batch_waiters.drain() {
+            info!("Cancelling digest: {} with {} waiters", digest, waiters.len());
+            for tx in waiters {
+                let _ = tx.send(false);
+            }
         }
     }
 

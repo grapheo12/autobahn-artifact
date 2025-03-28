@@ -259,7 +259,7 @@ impl Worker {
 //Note: Only expect to receive client messages submitting new transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<(Transaction, oneshot::Sender<()>)>,  //sender channel to connect to batch maker
+    tx_batch_maker: Sender<(Transaction, oneshot::Sender<bool>)>,  //sender channel to connect to batch maker
     
 }
 
@@ -280,7 +280,7 @@ impl AsyncMessageHandler for TxReceiverHandler {
         ack.put_u64(_x);
         ack.put_u64(_counter);
         ack.put_u64(_r);
-        ack.put_u64(0xdeadbeef);
+        // ack.put_u64(0xdeadbeef);
 
         if sample_or_not == 0u8 {
             info!("Sending to batch maker {}", id);
@@ -291,7 +291,7 @@ impl AsyncMessageHandler for TxReceiverHandler {
             .await
             .expect("Failed to send transaction");
 
-        resp_tx.send((ack.freeze(), rx)).await.expect("Failed to send response");
+        resp_tx.send((ack, rx)).await.expect("Failed to send response");
 
         // // Give the change to schedule other tasks.
         // // tokio::task::yield_now().await;

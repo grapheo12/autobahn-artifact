@@ -12,6 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use bytes::BytesMut;
+use bytes::BufMut as _;
 
 #[cfg(test)]
 #[path = "tests/receiver_tests.rs"]
@@ -93,7 +95,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
 }
 
 
-pub type AsyncMessageResponse = (Bytes, oneshot::Receiver<()>);
+pub type AsyncMessageResponse = (BytesMut, oneshot::Receiver<bool>);
 
 #[async_trait]
 pub trait AsyncMessageHandler: Clone + Send + Sync + 'static {
@@ -164,9 +166,14 @@ impl<Handler: AsyncMessageHandler> AsyncReceiver<Handler> {
     async fn spawn_reply_handler(mut writer: futures::stream::SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>, peer: SocketAddr, mut rx: tokio::sync::mpsc::Receiver<AsyncMessageResponse>) {
         tokio::spawn(async move {
             let mut writer = writer;
-            while let Some((msg, fut)) = rx.recv().await {
-                let _ = fut.await.unwrap();
-                if let Err(e) = writer.send(msg).await {
+            while let Some((mut msg, fut)) = rx.recv().await {
+                let success = fut.await.unwrap();
+                if success {
+                    msg.put_u64(0xcafebabe);
+                } else {
+                    msg.put_u64(0xdeadbeef);
+                }
+                if let Err(e) = writer.send(msg.freeze()).await {
                     warn!("{}", e);
                     return;
                 }

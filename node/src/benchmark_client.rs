@@ -158,7 +158,7 @@ impl Client {
                                 // println!("Inserting sample transaction {} {} {} {}", (counter as u64) | (r << 32), x, counter, r);
                                 request_store.insert((x, counter, r), start_time);
                                 // response_store.insert((x, counter, r));
-                                sema_tx.send(true).await;
+                                // sema_tx.send(true).await;
                             // }
                         }
                     },
@@ -187,9 +187,15 @@ impl Client {
                             //     assert!(resp.get_u8() == 1u8);
                             //     assert!(resp.get_u64() == r);
                             // }
-                            assert!(resp.get_u64() == 0xdeadbeef);
+                            let success = resp.get_u64();
+                            if success == 0xdeadbeef {
+                                // The transaction probably failed.
+                                request_store.remove(&(x, counter, r));
+                            } else {
+                                assert!(success == 0xcafebabe);
+                            }
 
-                            // sema_tx.send(true).await;
+                            sema_tx.send(true).await;
                         } else {
                             warn!("Failed to receive transaction ack");
                             break 'main2;
@@ -263,7 +269,7 @@ impl Client {
         info!("Start sending transactions");
 
         'main: loop {
-            interval.as_mut().tick().await;
+            // interval.as_mut().tick().await;
             let now = Instant::now();
             for x in 0..burst {
                 let _ = sema_rx.recv().await;
