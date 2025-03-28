@@ -157,42 +157,44 @@ impl Client {
                             //     r = r & ((1 << 32) - 1);
                                 // println!("Inserting sample transaction {} {} {} {}", (counter as u64) | (r << 32), x, counter, r);
                                 request_store.insert((x, counter, r), start_time);
-                            // }
-                        }
-                    },
-
-                    resp = transport_receiver.next() => {
-                        if let Some(Result::Ok(mut resp)) = resp {
-                            let tag = resp.get_u8();
-                            let id = resp.get_u64();
-                            let x = resp.get_u64();
-                            let counter = resp.get_u64();
-                            let r = resp.get_u64();
-
-                            // if tag == 0u8 {
-                                // let counter = id & ((1 << 32) - 1);
-                                // let r = id >> 32;
-
-                                // assert!(x == counter % _burst);
-                                // println!("Received sample transaction {} {} {} {}", id, x, counter, r);
-
                                 response_store.insert((x, counter, r));
+                                sema_tx.send(true).await;
                             // }
-                            // if x == counter % burst {
-                            //     assert!(resp.get_u8() == 0u8);
-                            //     assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
-                            // } else {
-                            //     assert!(resp.get_u8() == 1u8);
-                            //     assert!(resp.get_u64() == r);
-                            // }
-                            assert!(resp.get_u64() == 0xdeadbeef);
-
-                            sema_tx.send(true).await;
-                        } else {
-                            warn!("Failed to receive transaction ack");
-                            break 'main2;
                         }
                     },
+
+                    // resp = transport_receiver.next() => {
+                    //     if let Some(Result::Ok(mut resp)) = resp {
+                    //         let tag = resp.get_u8();
+                    //         let id = resp.get_u64();
+                    //         let x = resp.get_u64();
+                    //         let counter = resp.get_u64();
+                    //         let r = resp.get_u64();
+
+                    //         // if tag == 0u8 {
+                    //             // let counter = id & ((1 << 32) - 1);
+                    //             // let r = id >> 32;
+
+                    //             // assert!(x == counter % _burst);
+                    //             // println!("Received sample transaction {} {} {} {}", id, x, counter, r);
+
+                    //             response_store.insert((x, counter, r));
+                    //         // }
+                    //         // if x == counter % burst {
+                    //         //     assert!(resp.get_u8() == 0u8);
+                    //         //     assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                    //         // } else {
+                    //         //     assert!(resp.get_u8() == 1u8);
+                    //         //     assert!(resp.get_u64() == r);
+                    //         // }
+                    //         assert!(resp.get_u64() == 0xdeadbeef);
+
+                    //         sema_tx.send(true).await;
+                    //     } else {
+                    //         warn!("Failed to receive transaction ack");
+                    //         break 'main2;
+                    //     }
+                    // },
 
                     _ = log_interval.tick() => {
                         if latency_count > 0 {
