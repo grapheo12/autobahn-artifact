@@ -15,6 +15,8 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use network::SimpleSender;
+use crate::PrimaryWorkerMessage;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -71,6 +73,9 @@ impl State {
 }
 
 pub struct Committer {
+    name: PublicKey,
+    committee: Committee,
+    network: SimpleSender,
     gc_depth: Height,
     rx_mempool: Receiver<Certificate>,
     rx_deliver: Receiver<Certificate>,
@@ -82,6 +87,7 @@ pub struct Committer {
 
 impl Committer {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         gc_depth: Height,
@@ -101,6 +107,8 @@ impl Committer {
 
         tokio::spawn(async move {
             Self {
+                name,
+                committee: committee.clone(),
                 gc_depth,
                 rx_mempool,
                 rx_deliver,
@@ -108,6 +116,7 @@ impl Committer {
                 tx_output,
                 synchronizer,
                 genesis,
+                network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -164,6 +173,17 @@ impl Committer {
                                         debug!("Failed to send block through the output channel: {}", e);
                                     }
                                     debug!("Finish upcall");
+
+
+                                    for (digest, id) in header.payload.iter() {
+                                        let msg = PrimaryWorkerMessage::CommitAck(digest.clone());
+                                        let bytes = bincode::serialize(&msg).expect("Could not serialize msg");
+                                        let addr = self.committee.worker(&self.name, id).expect("This worker should exist").primary_to_worker;
+                                        
+                                        info!("Sending {:?} to {:?}", msg, addr);
+                                        self.network.send(addr, bytes.into()).await;
+                                        // self.network.flush().await;
+                                    }
                                 }
                             }
                             state.last_executed_slot += 1;

@@ -27,6 +27,9 @@ use tokio::time::{sleep, Duration, Instant};
 use store::Store;
 use std::convert::TryInto as _;
 use primary::timer::Timer;
+use tokio::sync::oneshot;
+use bytes::BytesMut;
+use std::collections::HashMap;
 
 
 #[cfg(test)]
@@ -62,7 +65,8 @@ pub struct BatchMaker {
     /// The maximum delay after which to seal the batch (in ms).
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
-    rx_transaction: Receiver<Transaction>,
+    rx_transaction: Receiver<(Transaction, oneshot::Sender<bool>)>,
+    rx_batch_commit: Receiver<Digest>,
    
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
@@ -71,6 +75,8 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
     current_batch: Batch,
+    current_batch_waiters: Vec<oneshot::Sender<bool>>,
+    all_batch_waiters: HashMap<Digest, Vec<oneshot::Sender<bool>>>, // batch hash => vec of waiting chans
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
@@ -108,7 +114,8 @@ impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
-        rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler 
+        rx_transaction: Receiver<(Transaction, oneshot::Sender<bool>)>, //receiver channel from worker.TxReceiverHandler 
+        rx_batch_commit: Receiver<Digest>,
         tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
         tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -132,6 +139,8 @@ impl BatchMaker {
                 tx_batch,  
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
+                current_batch_waiters: Vec::with_capacity(batch_size * 2),
+                all_batch_waiters: HashMap::new(), // batch hash => vec of waiting chans
                 current_batch_size: 0,
                 network: SimpleSender::new(),
                 //network: ReliableSender::new(),
@@ -148,6 +157,7 @@ impl BatchMaker {
                 keys,
                 name,
                 async_timer_futures: FuturesUnordered::new(),
+                rx_batch_commit,
             }
             .run()
             .await;
@@ -210,8 +220,9 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    self.current_batch_size += transaction.len();
-                    self.current_batch.push(transaction);
+                    self.current_batch_size += transaction.0.len();
+                    self.current_batch.push(transaction.0);
+                    self.current_batch_waiters.push(transaction.1);
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
 
@@ -238,6 +249,11 @@ impl BatchMaker {
                     debug!("partition queue size is {:?}", self.partition_queue.len());
                 },
 
+                Some(digest) = self.rx_batch_commit.recv() => {
+                    info!("Batch worker got {}", digest);
+                    self.reply_all(digest).await;
+                },
+
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 /*() = &mut timer1 => {
                     debug!("BatchMaker: partition delay timer 1 triggered");
@@ -261,6 +277,27 @@ impl BatchMaker {
             tokio::task::yield_now().await;
         }
     }
+
+    async fn reply_all(&mut self, digest: Digest) {
+        if let Some(waiters) = self.all_batch_waiters.remove(&digest) {
+            info!("Replying to {} waiters", waiters.len());
+            for tx in waiters {
+                let _ = tx.send(true);
+            }
+        } else {
+            info!("Missing batch for reply: {}", digest);
+        }
+    }
+
+    async fn cancel_all_request(&mut self) {
+        for (digest, waiters) in self.all_batch_waiters.drain() {
+            info!("Cancelling digest: {} with {} waiters", digest, waiters.len());
+            for tx in waiters {
+                let _ = tx.send(false);
+            }
+        }
+    }
+
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
@@ -304,13 +341,16 @@ impl BatchMaker {
             info!("Batch {:?} contains {} B", digest, size);
         }
 
+        
         // Broadcast the batch through the network.
-
+        
         //NEW:
         //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
         
         let bytes = Bytes::from(serialized.clone());
         let digest = Digest(Sha512::digest(&serialized).as_slice()[..32].try_into().unwrap());
+        let waiters = self.current_batch_waiters.drain(..).collect();
+        self.all_batch_waiters.insert(digest.clone(), waiters);
 
         // Store the batch.
         self.store.write(digest.to_vec(), serialized.clone()).await;

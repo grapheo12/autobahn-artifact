@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use log::info;
 
 #[cfg(test)]
 #[path = "tests/synchronizer_tests.rs"]
@@ -54,6 +55,8 @@ pub struct Synchronizer {
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
 
     cancel_handlers: HashMap<Digest, Vec<CancelHandler>>,
+
+    tx_batch_commit: Sender<Digest>,
 }
 
 impl Synchronizer {
@@ -67,6 +70,7 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        tx_batch_commit: Sender<Digest>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -83,6 +87,7 @@ impl Synchronizer {
                 round: Round::default(),
                 pending: HashMap::new(),
                 cancel_handlers: HashMap::new(),
+                tx_batch_commit,
             }
             .run()
             .await;
@@ -192,6 +197,10 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);*/
+                    },
+                    PrimaryWorkerMessage::CommitAck(digest) => {
+                        info!("Got Commit ack for {}", digest);
+                        self.tx_batch_commit.send(digest).await;
                     },
                     _ => {},
                 },

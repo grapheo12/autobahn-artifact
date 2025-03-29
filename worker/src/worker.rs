@@ -13,7 +13,7 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{debug, error, info, warn};
-use network::{MessageHandler, Receiver, Writer};
+use network::{MessageHandler, Receiver, Writer, AsyncMessageHandler, AsyncReceiver, AsyncMessageResponse};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -23,6 +23,10 @@ use tokio::sync::mpsc::{channel, Sender, Receiver as OtherReceiver};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use std::convert::TryInto;
+use bytes::Buf as _;
+use tokio::sync::oneshot;
+use bytes::BytesMut;
+use bytes::BufMut as _;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -77,9 +81,10 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_commit, rx_batch_commit) = channel(CHANNEL_CAPACITY);
         
-        worker.handle_primary_messages();                         //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone());   //spawns async task that listens for network messages from Client
+        worker.handle_primary_messages(tx_batch_commit);                         //spawns async task that listens for network message from Primary
+        worker.handle_clients_transactions(tx_primary.clone(), rx_batch_commit);   //spawns async task that listens for network messages from Client
         worker.handle_workers_messages(tx_primary);               //spawns async task that listens for network messages from other Workers
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -109,7 +114,7 @@ impl Worker {
 
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, tx_batch_commit: tokio::sync::mpsc::Sender<Digest>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and Synchronizer
 
         // Receive incoming messages from our primary.
@@ -135,7 +140,8 @@ impl Worker {
             self.parameters.gc_depth,
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
-            /* rx_message */ rx_synchronizer,   
+            /* rx_message */ rx_synchronizer,
+            tx_batch_commit,
         );
 
         info!(
@@ -145,7 +151,7 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {  //tx_primary: channel between processor and PrimaryConnector
+    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>, rx_batch_commit: tokio::sync::mpsc::Receiver<Digest>) {  //tx_primary: channel between processor and PrimaryConnector
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
@@ -157,7 +163,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
+        AsyncReceiver::spawn(
             address,                                            //socket to receive Client messages from
             /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
         );
@@ -196,6 +202,7 @@ impl Worker {
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,  //receiver channel to connect to TxReceiverHandler 
+            rx_batch_commit,
             /*tx_message*/ tx_quorum_waiter,   //sender channel to connect to quorum waiter
            /* tx_batch */ tx_processor,  //sender channel to connect to processor
             /* workers_addresses */
@@ -213,6 +220,7 @@ impl Worker {
             self.parameters.affected_nodes.clone(),
             self.committee.authorities.keys().cloned().collect(),
             self.name.clone(),
+
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -293,20 +301,42 @@ impl Worker {
 //Note: Only expect to receive client messages submitting new transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
+    tx_batch_maker: Sender<(Transaction, oneshot::Sender<bool>)>,  //sender channel to connect to batch maker
 }
 
 #[async_trait]
-impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+impl AsyncMessageHandler for TxReceiverHandler {
+    async fn dispatch(&self, message: Bytes, resp_tx: Sender<AsyncMessageResponse>) -> Result<(), Box<dyn Error>> {
+        let (tx, rx) = oneshot::channel();
         // Send the transaction to the batch maker.
+        let mut ack = BytesMut::new();
+        let mut _m = message.clone();
+        let sample_or_not = _m.get_u8();
+        let id = _m.get_u64();
+        let _x = _m.get_u64();
+        let _counter = _m.get_u64();
+        let _r = _m.get_u64();
+        ack.put_u8(sample_or_not);
+        ack.put_u64(id);
+        ack.put_u64(_x);
+        ack.put_u64(_counter);
+        ack.put_u64(_r);
+        // ack.put_u64(0xdeadbeef);
+
+        if sample_or_not == 0u8 {
+            info!("Sending to batch maker {}", id);
+        }
+        
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send((message.to_vec(), tx))
             .await
             .expect("Failed to send transaction");
 
+        resp_tx.send((ack, rx)).await.expect("Failed to send response");
+
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
+
         Ok(())
     }
 }
