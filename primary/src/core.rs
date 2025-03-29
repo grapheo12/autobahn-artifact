@@ -1665,7 +1665,7 @@ impl Core {
                 // Process any forwarded commit messages
                 // NOTE: Used "dummy header" for second argument for now, header doesn't matter since proposal syncing
                 // does not block processing the header, only prepare messages do
-                self.process_commit_message(consensus_message, &self.current_header.clone());
+                self.process_commit_message(consensus_message, &self.current_header.clone()).await?;
             },
             _ => {}
         }
