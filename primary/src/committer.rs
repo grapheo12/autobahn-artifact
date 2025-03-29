@@ -180,7 +180,7 @@ impl Committer {
                                         let bytes = bincode::serialize(&msg).expect("Could not serialize msg");
                                         let addr = self.committee.worker(&self.name, id).expect("This worker should exist").primary_to_worker;
                                         
-                                        info!("Sending {:?} to {:?}", msg, addr);
+                                        // info!("Sending {:?} to {:?}", msg, addr);
                                         self.network.send(addr, bytes.into()).await;
                                         // self.network.flush().await;
                                     }

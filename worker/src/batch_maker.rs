@@ -250,7 +250,7 @@ impl BatchMaker {
                 },
 
                 Some(digest) = self.rx_batch_commit.recv() => {
-                    info!("Batch worker got {}", digest);
+                    // info!("Batch worker got {}", digest);
                     self.reply_all(digest).await;
                 },
 
@@ -280,12 +280,12 @@ impl BatchMaker {
 
     async fn reply_all(&mut self, digest: Digest) {
         if let Some(waiters) = self.all_batch_waiters.remove(&digest) {
-            info!("Replying to {} waiters", waiters.len());
+            // info!("Replying to {} waiters", waiters.len());
             for tx in waiters {
                 let _ = tx.send(true);
             }
         } else {
-            info!("Missing batch for reply: {}", digest);
+            // info!("Missing batch for reply: {}", digest);
         }
     }
 

@@ -199,7 +199,7 @@ impl Synchronizer {
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);*/
                     },
                     PrimaryWorkerMessage::CommitAck(digest) => {
-                        info!("Got Commit ack for {}", digest);
+                        // info!("Got Commit ack for {}", digest);
                         self.tx_batch_commit.send(digest).await;
                     },
                     _ => {},
