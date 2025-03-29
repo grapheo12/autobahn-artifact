@@ -1579,7 +1579,7 @@ impl Core {
 
                 // Garbage collect (can be ascyn)
                 //self.clean_slot(sl);
-                self.clean_slot_periods(sl);
+                self.clean_slot_periods(sl).await?;
             }
             _ => {}
         }
