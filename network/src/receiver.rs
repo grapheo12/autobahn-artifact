@@ -4,11 +4,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::SplitSink;
 use futures::stream::StreamExt as _;
+use futures::sink::SinkExt as _;
 use log::{debug, info, warn};
 use std::error::Error;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
+use bytes::BytesMut;
+use bytes::BufMut as _;
 
 #[cfg(test)]
 #[path = "tests/receiver_tests.rs"]
@@ -83,6 +88,97 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                         return;
                     }
                 }
+            }
+            warn!("Connection closed by peer {}", peer);
+        });
+    }
+}
+
+
+pub type AsyncMessageResponse = (BytesMut, oneshot::Receiver<bool>);
+
+#[async_trait]
+pub trait AsyncMessageHandler: Clone + Send + Sync + 'static {
+    async fn dispatch(&self, message: Bytes, resp_tx: Sender<AsyncMessageResponse>) -> Result<(), Box<dyn Error>>;
+}
+
+pub struct AsyncReceiver<Handler: AsyncMessageHandler> {
+    /// Address to listen to.
+    address: SocketAddr,
+    /// Struct responsible to define how to handle received messages.
+    handler: Handler,   
+}
+
+impl<Handler: AsyncMessageHandler> AsyncReceiver<Handler> {
+    /// Spawn a new network receiver handling connections from any incoming peer.
+    pub fn spawn(address: SocketAddr, handler: Handler) {
+        tokio::spawn(async move {
+            Self { address, handler }.run().await;
+        });
+    }
+
+    /// Main loop responsible to accept incoming connections and spawn a new runner to handle it.
+    async fn run(&self) {
+        //println!("receiver address {}", self.address.clone().to_string());
+        let listener = TcpListener::bind(&self.address)
+            .await
+            .expect("Failed to bind TCP port");
+
+        debug!("Listening on {}", self.address);
+        loop {
+            let (socket, peer) = match listener.accept().await {
+                Ok(value) => value,
+                Err(e) => {
+                    warn!("{}", NetworkError::FailedToListen(e));
+                    continue;
+                }
+            };
+            socket.set_nodelay(true).unwrap();
+            let transport = Framed::new(socket, LengthDelimitedCodec::new());
+            let (mut writer, mut reader) = transport.split();
+            let (tx, rx) = tokio::sync::mpsc::channel(1000);
+            info!("Incoming connection established with {}", peer);
+            Self::spawn_message_handler(reader, peer, self.handler.clone(), tx).await;
+            Self::spawn_reply_handler(writer, peer, rx).await;
+        }
+    }
+
+    async fn spawn_message_handler(mut reader: futures::stream::SplitStream<Framed<TcpStream, LengthDelimitedCodec>>, peer: SocketAddr, handler: Handler, tx: Sender<AsyncMessageResponse>) {
+        tokio::spawn(async move {
+            while let Some(frame) = reader.next().await {
+                match frame {
+                    Ok(message) => {
+                        if let Err(e) = handler.dispatch(message.freeze(), tx.clone()).await {
+                            warn!("{}", e);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("{}", e);
+                        return;
+                    }
+                }
+            }
+            warn!("Connection closed by peer {}", peer);
+        });
+    }
+
+    async fn spawn_reply_handler(mut writer: futures::stream::SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>, peer: SocketAddr, mut rx: tokio::sync::mpsc::Receiver<AsyncMessageResponse>) {
+        tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some((mut msg, fut)) = rx.recv().await {
+                let success = fut.await.unwrap();
+                if success {
+                    msg.put_u64(0xcafebabe);
+                } else {
+                    msg.put_u64(0xdeadbeef);
+                }
+                if let Err(e) = writer.send(msg.freeze()).await {
+                    warn!("{}", e);
+                    return;
+                }
+
+                writer.flush().await.unwrap();
             }
             warn!("Connection closed by peer {}", peer);
         });
