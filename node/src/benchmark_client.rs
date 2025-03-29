@@ -17,6 +17,7 @@ use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::task::JoinSet;
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -73,10 +74,10 @@ async fn main() -> Result<()> {
     info!("Number of clients: {}", clients);
 
     
-    let mut futs = FuturesUnordered::new();
+    let mut futs = JoinSet::new();
     for _ in 0..clients {
         let _nodes = nodes.iter().map(|e| e.clone()).collect::<Vec<_>>();
-        futs.push(async move {
+        futs.spawn(async move {
             let client = Arc::new(Box::pin(Client {
                 target,
                 size,
@@ -92,7 +93,7 @@ async fn main() -> Result<()> {
     }
 
     for _ in 0..clients {
-        futs.next().await;
+        futs.join_next().await;
     }
 
     Ok(())
