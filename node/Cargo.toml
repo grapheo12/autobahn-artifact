@@ -21,6 +21,7 @@ store = { path = "../store" }
 crypto = { path = "../crypto" }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
+snmalloc-rs = "0.3.8"
 #hotstuff = { path = "../hotstuff" }
 #sailfish = { path = "../sailfish" }
 

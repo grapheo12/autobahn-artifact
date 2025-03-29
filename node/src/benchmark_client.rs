@@ -1,17 +1,26 @@
+use anyhow::Ok;
 // Copyright(C) Facebook, Inc. and its affiliates.
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
+use bytes::{Buf, BufMut as _};
 use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
 use env_logger::Env;
 use futures::future::join_all;
 use futures::sink::SinkExt as _;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use log::{info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,7 +29,7 @@ async fn main() -> Result<()> {
         .about("Benchmark client for Sailfish.")
         .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
-        .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
+        .args_from_usage("--clients=<INT> 'Number of clients'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
@@ -39,8 +48,8 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<usize>()
         .context("The size of transactions must be a non-negative integer")?;
-    let rate = matches
-        .value_of("rate")
+    let clients = matches
+        .value_of("clients")
         .unwrap()
         .parse::<u64>()
         .context("The rate of transactions must be a non-negative integer")?;
@@ -58,20 +67,35 @@ async fn main() -> Result<()> {
     info!("Transactions size: {} B", size);
 
     // NOTE: This log entry is used to compute performance.
+    let rate = 200_000;
     info!("Transactions rate: {} tx/s", rate);
 
-    let client = Client {
-        target,
-        size,
-        rate,
-        nodes,
-    };
+    info!("Number of clients: {}", clients);
 
-    // Wait for all nodes to be online and synchronized.
-    client.wait().await;
+    
+    let mut futs = FuturesUnordered::new();
+    for _ in 0..clients {
+        let _nodes = nodes.iter().map(|e| e.clone()).collect::<Vec<_>>();
+        futs.push(async move {
+            let client = Arc::new(Box::pin(Client {
+                target,
+                size,
+                rate,
+                nodes: _nodes,
+            }));
+            
+            // Wait for all nodes to be online and synchronized.
+            client.wait().await;
+            // Start the benchmark.
+            client.send().await;
+        });
+    }
 
-    // Start the benchmark.
-    client.send().await.context("Failed to submit transactions")
+    for _ in 0..clients {
+        futs.next().await;
+    }
+
+    Ok(())
 }
 
 struct Client {
@@ -85,6 +109,7 @@ impl Client {
     pub async fn send(&self) -> Result<()> {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
+        const MAX_CONCURRENT_TXS: usize = 32;
 
         // The transaction size must be at least 16 bytes to ensure all txs are different.
         if self.size < 9 {
@@ -98,12 +123,145 @@ impl Client {
             .await
             .context(format!("failed to connect to {}", self.target))?;
 
+        stream.set_nodelay(true)?;
+
         // Submit all transactions.
         let burst = self.rate / PRECISION;
+        let _burst = burst;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
         let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+        let (mut transport_sender, mut transport_receiver) = transport.split();
+        let (sema_tx, mut sema_rx) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TXS);
+        let (sema_tx2, mut sema_rx2) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TXS);
+        for _ in 0..MAX_CONCURRENT_TXS {
+            sema_tx.send(true).await;
+        }
+
+        tokio::spawn(async move {
+            let mut request_store = HashMap::new();
+            let mut response_store = HashSet::new();
+            let mut total_latency = Duration::new(0, 0);
+            let mut min_latency = Duration::new(u64::MAX, 0);
+            let mut max_latency = Duration::new(0, 0);
+            let mut total_latency_from_sampled = Duration::new(0, 0);
+            let mut latency_count = 0;
+            let mut latency_count_from_sampled = 0;
+            let mut log_interval = interval(Duration::from_secs(1));
+            'main2: loop {
+                tokio::select! {
+                    req = sema_rx2.recv() => {
+                        if let Some((x, counter, mut r, start_time)) = req {
+                            // if x == counter % _burst {
+                            //     r = r & ((1 << 32) - 1);
+                                // println!("Inserting sample transaction {} {} {} {}", (counter as u64) | (r << 32), x, counter, r);
+                                request_store.insert((x, counter, r), start_time);
+                                // response_store.insert((x, counter, r));
+                                // sema_tx.send(true).await;
+                            // }
+                        }
+                    },
+
+                    resp = transport_receiver.next() => {
+                        if let Some(Result::Ok(mut resp)) = resp {
+                            let tag = resp.get_u8();
+                            let id = resp.get_u64();
+                            let x = resp.get_u64();
+                            let counter = resp.get_u64();
+                            let r = resp.get_u64();
+
+                            // if tag == 0u8 {
+                                // let counter = id & ((1 << 32) - 1);
+                                // let r = id >> 32;
+
+                                // assert!(x == counter % _burst);
+                                // println!("Received sample transaction {} {} {} {}", id, x, counter, r);
+
+                                response_store.insert((x, counter, r));
+                            // }
+                            // if x == counter % burst {
+                            //     assert!(resp.get_u8() == 0u8);
+                            //     assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                            // } else {
+                            //     assert!(resp.get_u8() == 1u8);
+                            //     assert!(resp.get_u64() == r);
+                            // }
+                            let success = resp.get_u64();
+                            if success == 0xdeadbeef {
+                                // The transaction probably failed.
+                                request_store.remove(&(x, counter, r));
+                            } else {
+                                assert!(success == 0xcafebabe);
+                            }
+
+                            sema_tx.send(true).await;
+                        } else {
+                            warn!("Failed to receive transaction ack");
+                            break 'main2;
+                        }
+                    },
+
+                    _ = log_interval.tick() => {
+                        if latency_count > 0 {
+                            let avg_latency = total_latency / latency_count;
+                            // Print average over a 1s window.
+                            info!("Client latency: {} ms", avg_latency.as_millis());
+                            latency_count = 0;
+                            total_latency = Duration::new(0, 0);
+                        }
+
+                        if latency_count_from_sampled > 0 {
+                            let avg_latency = total_latency_from_sampled / latency_count_from_sampled;
+                            // Print average over a 1s window.
+                            info!("Sampled client latency: {} ms", avg_latency.as_millis());
+                            latency_count_from_sampled = 0;
+                            total_latency_from_sampled = Duration::new(0, 0);
+                        }
+
+                        if min_latency != Duration::new(u64::MAX, 0) {
+                            info!("Min client latency: {} ms", min_latency.as_millis());
+                            min_latency = Duration::new(u64::MAX, 0);
+                        }
+
+                        if max_latency != Duration::new(0, 0) {
+                            info!("Max client latency: {} ms", max_latency.as_millis());
+                            max_latency = Duration::new(0, 0);
+                        }
+                    }
+
+                }
+
+                let mut to_remove = vec![];
+                for (x, counter, r) in response_store.iter() {
+                    if request_store.contains_key(&(*x, *counter, *r)) {
+                        to_remove.push((*x, *counter, *r));
+                    }
+                }
+
+                for (x, counter, r) in to_remove {
+                    let start_time: Instant = request_store.remove(&(x, counter, r)).unwrap();
+                    let duration: Duration = start_time.elapsed();
+                    response_store.remove(&(x, counter, r));
+
+                    total_latency += duration;
+                    latency_count += 1;
+
+                    if x == counter % _burst {
+                        total_latency_from_sampled += duration;
+                        latency_count_from_sampled += 1;
+                    }
+
+                    if duration < min_latency {
+                        min_latency = duration;
+                    }
+
+                    if duration > max_latency {
+                        max_latency = duration;
+                    }
+                }
+            }
+        });
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
 
@@ -111,30 +269,69 @@ impl Client {
         info!("Start sending transactions");
 
         'main: loop {
-            interval.as_mut().tick().await;
+            // interval.as_mut().tick().await;
             let now = Instant::now();
-
             for x in 0..burst {
+                let _ = sema_rx.recv().await;
+                let start_time = Instant::now();
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    info!("Sending sample transaction {}", (counter as u64) | (r << 32));
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64((counter as u64) | (r << 32)); // This counter identifies the tx.
+                    tx.put_u64(x);
+                    tx.put_u64(counter);
+                    tx.put_u64(r);
                 } else {
-                    r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
                     tx.put_u64(r); // Ensures all clients send different txs.
+                    tx.put_u64(x);
+                    tx.put_u64(counter);
+                    tx.put_u64(r);
                 };
-
+                // while self.size > tx.len() {
+                //     tx.put_u8(rand::random());
+                // }
                 tx.resize(self.size, 0u8); //Truncate any bits past size
                 let bytes = tx.split().freeze(); //split() moves byte content from tx to bytes (i.e. avoids copy). freeze() makes it const so it can be shared. (bytes can now be used/sent async)
                 //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
-                if let Err(e) = transport.send(bytes).await { //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
+                if let Err(e) = transport_sender.send(bytes).await { //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
                 }
+                transport_sender.flush().await?;
+
+                sema_tx2.send((x, counter, r, start_time)).await;
+
+                // match transport_receiver.next().await {
+                //     Some(Result::Ok(mut resp)) => {
+                //         if x == counter % burst {
+                //             assert!(resp.get_u8() == 0u8);
+                //             assert!(resp.get_u64() == ((counter as u64) | (r << 32)));
+                //         } else {
+                //             assert!(resp.get_u8() == 1u8);
+                //             assert!(resp.get_u64() == r);
+                //         }
+                //         assert!(resp.get_u64() == 0xdeadbeef);
+                //     },
+                //     _ => {
+                //         warn!("Failed to receive transaction ack");
+                //         break 'main;
+                //     }
+                // }
+                // if x == counter % burst {
+                //     let duration = start_time.elapsed();
+                //     info!("Client latency: {} ms", duration.as_millis());
+                // }
+
+
+                r += 1;
             }
+
+            // for x in 0..burst {
+            // }
+
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
                 // NOTE: This log entry is used to compute performance.
                 warn!("Transaction rate too high for this client");
