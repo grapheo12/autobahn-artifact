@@ -243,19 +243,19 @@ impl BatchMaker {
 
                     self.num_ticks_before_requests_cancelled += 1;
 
-                    if self.num_ticks_before_requests_cancelled == 1000 {
+                    if self.num_ticks_before_requests_cancelled == 10000 {
                         self.num_ticks_before_requests_cancelled = 0;
                         self.cancel_all_request().await;
                     }
 
-                    
-                    if self.current_batch.is_empty() {
-                        self.current_batch.push(vec![rand::thread_rng().gen(); 128]);
-                    }
 
-                    // if !self.current_batch.is_empty() {
-                        self.seal().await;
+                    // if self.current_batch.is_empty() {
+                    //     self.current_batch.push(vec![rand::thread_rng().gen(); 128]);
                     // }
+
+                    if !self.current_batch.is_empty() {
+                        self.seal().await;
+                    }
 
 
                     current_time = Instant::now();

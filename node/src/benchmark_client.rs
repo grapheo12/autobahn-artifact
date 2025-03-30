@@ -110,7 +110,7 @@ impl Client {
     pub async fn send(&self) -> Result<()> {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
-        const MAX_CONCURRENT_TXS: usize = 32;
+        const MAX_CONCURRENT_TXS: usize = 128;
 
         // The transaction size must be at least 16 bytes to ensure all txs are different.
         if self.size < 9 {
