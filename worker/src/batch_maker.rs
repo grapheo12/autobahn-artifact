@@ -30,6 +30,7 @@ use primary::timer::Timer;
 use tokio::sync::oneshot;
 use bytes::BytesMut;
 use std::collections::HashMap;
+use rand::prelude::*;
 
 
 #[cfg(test)]
@@ -108,6 +109,8 @@ pub struct BatchMaker {
     pub name: PublicKey,
     // async timer futures
     pub async_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = (Slot, View)> + Send>>>,
+
+    num_ticks_before_requests_cancelled: u64,
 }
 
 impl BatchMaker {
@@ -158,6 +161,7 @@ impl BatchMaker {
                 name,
                 async_timer_futures: FuturesUnordered::new(),
                 rx_batch_commit,
+                num_ticks_before_requests_cancelled: 0,
             }
             .run()
             .await;
@@ -236,9 +240,23 @@ impl BatchMaker {
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     debug!("BatchMaker: max batch delay timer triggered");
-                    if !self.current_batch.is_empty() {
-                        self.seal().await;
+
+                    self.num_ticks_before_requests_cancelled += 1;
+
+                    if self.num_ticks_before_requests_cancelled == 1000 {
+                        self.num_ticks_before_requests_cancelled = 0;
+                        self.cancel_all_request().await;
                     }
+
+                    
+                    if self.current_batch.is_empty() {
+                        self.current_batch.push(vec![rand::thread_rng().gen(); 128]);
+                    }
+
+                    // if !self.current_batch.is_empty() {
+                        self.seal().await;
+                    // }
+
 
                     current_time = Instant::now();
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
