@@ -233,6 +233,12 @@ impl Client {
 
                 }
 
+                // for ((x, counter, r), start_time) in request_store.iter() {
+                //     if start_time.elapsed().as_millis() > 20 {
+                //         response_store.insert((*x, *counter, *r));
+                //     }
+                // }
+
                 let mut to_remove = vec![];
                 for (x, counter, r) in response_store.iter() {
                     if request_store.contains_key(&(*x, *counter, *r)) {
