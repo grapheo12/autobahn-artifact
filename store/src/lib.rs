@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use std::collections::{HashMap, VecDeque};
+use rocksdb::{DBCompactionStyle, Options, WriteOptions};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 
@@ -26,14 +27,28 @@ pub struct Store {
 
 impl Store {
     pub fn new(path: &str) -> StoreResult<Self> {
-        let db = rocksdb::DB::open_default(path)?;
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_write_buffer_size(2147483648);
+        opts.set_max_write_buffer_number(1);
+        opts.set_min_write_buffer_number_to_merge(1);
+        opts.set_target_file_size_base(2147483648 as u64);
+
+        opts.set_manual_wal_flush(true);
+        opts.set_compaction_style(DBCompactionStyle::Universal);
+        opts.set_allow_mmap_reads(true);
+        opts.set_allow_mmap_writes(true);
+
+        let db = rocksdb::DB::open(&opts, path)?;
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
-        let (tx, mut rx) = channel(100);
+        let (tx, mut rx) = channel(1000);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
                 match command {
                     StoreCommand::Write(key, value) => {
-                        let _ = db.put(&key, &value);
+                        let mut wopts = WriteOptions::default();
+                        wopts.disable_wal(true);
+                        let _ = db.put_opt(&key, &value, &wopts);
                         if let Some(mut senders) = obligations.remove(&key) {
                             while let Some(s) = senders.pop_front() {
                                 let _ = s.send(Ok(value.clone()));
