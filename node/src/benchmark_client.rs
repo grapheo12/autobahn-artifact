@@ -83,7 +83,7 @@ struct Client {
 
 impl Client {
     pub async fn send(&self) -> Result<()> {
-        const PRECISION: u64 = 2; // Sample precision.
+        const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
         // The transaction size must be at least 16 bytes to ensure all txs are different.
@@ -117,10 +117,13 @@ impl Client {
             for x in 0..burst {
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    r += 1;
+                    let _c = counter | (r << 32);
+
+                    info!("Sending sample transaction {}", _c);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(_c); // This counter identifies the tx.
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
