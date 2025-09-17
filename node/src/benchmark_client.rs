@@ -1,27 +1,28 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+mod client;
+mod reply_processor;
+mod transaction_sender;
+
+use client::{Client, ClientParameters};
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
-use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
+use config::{Committee, Import};
 use env_logger::Env;
-use futures::future::join_all;
-use futures::sink::SinkExt as _;
-use log::{info, warn};
-use rand::Rng;
+use log::info;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::time::{interval, sleep, Duration, Instant};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Benchmark client for Sailfish.")
-        .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
-        .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
-        .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
-        .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
+        .about("Benchmark client for Sailfish - now supports replies!")
+        .args_from_usage("--client-id=<INT> 'Unique identifier for this client (0-255)'")
+        .args_from_usage("--reply-addr=<ADDR> 'The address for receiving replies'")
+        .args_from_usage("--committee=<FILE> 'The file containing committee information'")
+        .args_from_usage("--size=[INT] 'The size of each transaction in bytes (default: 512)'")
+        .args_from_usage("--rate=[INT] 'The rate (txs/s) at which to send transactions (default: 1000)'")
+        .args_from_usage("--workers=[INT] 'The number of workers to send to (default: 1)'")
+        .args_from_usage("--threshold=[INT] 'Number of confirmations required (default: 1)'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
 
@@ -29,134 +30,66 @@ async fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    let target = matches
-        .value_of("ADDR")
+    let client_id = matches
+        .value_of("client-id")
+        .unwrap()
+        .parse::<u8>()
+        .context("The client ID must be between 0 and 255")?;
+
+    let reply_addr = matches
+        .value_of("reply-addr")
         .unwrap()
         .parse::<SocketAddr>()
-        .context("Invalid socket address format")?;
-    let size = matches
+        .context("Invalid reply address format")?;
+
+    let committee_file = matches.value_of("committee").unwrap();
+    let committee = Committee::import(committee_file)
+        .context("Failed to load committee information")?;
+
+    let transaction_size = matches
         .value_of("size")
-        .unwrap()
+        .unwrap_or("512")
         .parse::<usize>()
-        .context("The size of transactions must be a non-negative integer")?;
-    let rate = matches
+        .context("Transaction size must be a positive integer")?;
+
+    let transaction_rate = matches
         .value_of("rate")
-        .unwrap()
+        .unwrap_or("1000")
         .parse::<u64>()
-        .context("The rate of transactions must be a non-negative integer")?;
-    let nodes = matches
-        .values_of("nodes")
-        .unwrap_or_default()
-        .into_iter()
-        .map(|x| x.parse::<SocketAddr>())
-        .collect::<Result<Vec<_>, _>>()
-        .context("Invalid socket address format")?;
+        .context("Transaction rate must be a positive integer")?;
 
-    info!("Node address: {}", target);
+    let worker_count = matches
+        .value_of("workers")
+        .unwrap_or("1")
+        .parse::<usize>()
+        .context("Worker count must be a positive integer")?;
 
-    // NOTE: This log entry is used to compute performance.
-    info!("Transactions size: {} B", size);
+    let threshold = matches
+        .value_of("threshold")
+        .unwrap_or("1")
+        .parse::<usize>()
+        .context("Threshold must be a positive integer")?;
 
-    // NOTE: This log entry is used to compute performance.
-    info!("Transactions rate: {} tx/s", rate);
+    // NOTE: These log entries are used to compute performance.
+    info!("Client {} starting", client_id);
+    info!("Reply address: {}", reply_addr);
+    info!("Transactions size: {} B", transaction_size);
+    info!("Transactions rate: {} tx/s", transaction_rate);
+    info!("Worker count: {}", worker_count);
+    info!("Confirmation threshold: {}", threshold);
 
-    let client = Client {
-        target,
-        size,
-        rate,
-        nodes,
+    let client_parameters = ClientParameters {
+        transaction_size,
+        transaction_rate,
+        worker_count,
+        threshold,
     };
 
-    // Wait for all nodes to be online and synchronized.
-    client.wait().await;
+    // Spawn the client process
+    Client::spawn(client_id, committee, client_parameters, reply_addr);
 
-    // Start the benchmark.
-    client.send().await.context("Failed to submit transactions")
-}
-
-struct Client {
-    target: SocketAddr,  //specifies the worker to connect to
-    size: usize,         //specifies the bit size of transactions
-    rate: u64,
-    nodes: Vec<SocketAddr>,  //specifies the addresses of all nodes. Currently only used to wait for them to be alive, but also necessary if we wanted to receive result replies (from any node).
-}
-
-impl Client {
-    pub async fn send(&self) -> Result<()> {
-        const PRECISION: u64 = 20; // Sample precision.
-        const BURST_DURATION: u64 = 1000 / PRECISION;
-
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
-        if self.size < 9 {
-            return Err(anyhow::Error::msg(
-                "Transaction size must be at least 9 bytes",
-            ));
-        }
-
-        // Connect to the mempool.
-        let stream = TcpStream::connect(self.target)
-            .await
-            .context(format!("failed to connect to {}", self.target))?;
-
-        // Submit all transactions.
-        let burst = self.rate / PRECISION;
-        let mut tx = BytesMut::with_capacity(self.size);
-        let mut counter = 0;
-        let mut r = rand::thread_rng().gen();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
-        let interval = interval(Duration::from_millis(BURST_DURATION));
-        tokio::pin!(interval);
-
-        // NOTE: This log entry is used to compute performance.
-        info!("Start sending transactions");
-
-        'main: loop {
-            interval.as_mut().tick().await;
-            let now = Instant::now();
-
-            for x in 0..burst {
-                if x == counter % burst {
-                    // NOTE: This log entry is used to compute performance.
-                    r += 1;
-                    let _c = counter | (r << 32);
-
-                    info!("Sending sample transaction {}", _c);
-
-                    tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(_c); // This counter identifies the tx.
-                } else {
-                    r += 1;
-                    tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
-                };
-
-                tx.resize(self.size, 0u8); //Truncate any bits past size
-                let bytes = tx.split().freeze(); //split() moves byte content from tx to bytes (i.e. avoids copy). freeze() makes it const so it can be shared. (bytes can now be used/sent async)
-                //Note: Does not sign transactions. Transaction id-s are not unique w.r.t to content.
-                if let Err(e) = transport.send(bytes).await { //Uses TCP connection to send request to assigned worker. Note: Optimistically only sending to one worker.
-                    warn!("Failed to send transaction: {}", e);
-                    break 'main;
-                }
-            }
-            if now.elapsed().as_millis() > BURST_DURATION as u128 {
-                // NOTE: This log entry is used to compute performance.
-                warn!("Transaction rate too high for this client");
-            }
-            counter += 1;
-        }
-        Ok(())
-    }
-
-    pub async fn wait(&self) {
-        // Wait for all nodes to be online.
-        info!("Waiting for all nodes to be online...");
-        join_all(self.nodes.iter().cloned().map(|address| {
-            tokio::spawn(async move {
-                while TcpStream::connect(address).await.is_err() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-            })
-        }))
-        .await;
+    // Keep the main process alive
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
     }
 }

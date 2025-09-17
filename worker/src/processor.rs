@@ -8,7 +8,7 @@ use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
-use log::debug;
+use log::{debug, error, warn};
 
 #[cfg(test)]
 #[path = "tests/processor_tests.rs"]
@@ -41,6 +41,7 @@ impl Processor {
 
                 // Store the batch.
                 store.write(digest.to_vec(), batch).await;
+                
                 //store.write(digest.to_vec(), Vec::default()).await;
 
                 // Deliver the batch's digest.
@@ -50,11 +51,14 @@ impl Processor {
                 };
                 let message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
-                tx_digest
-                    .send(message)
-                    .await
-                    .expect("Failed to send digest");
+                
+                // Send digest to PrimaryConnector
+                if let Err(e) = tx_digest.send(message).await {
+                    error!("Processor: Failed to send digest to PrimaryConnector: {}", e);
+                    panic!("Processor channel to PrimaryConnector is closed");
+                }
             }
         });
     }
 }
+
