@@ -2,7 +2,7 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 use crate::messages::ConsensusMessage;
-use crate::primary::{Slot, CHANNEL_CAPACITY};
+use crate::primary::{Slot, CHANNEL_CAPACITY, PrimaryWorkerMessage};
 use crate::synchronizer::Synchronizer;
 use crate::{Certificate, Header, Height};
 //use crate::error::{ConsensusError, ConsensusResult};
@@ -15,6 +15,8 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use network::{ReliableSender, CancelHandler};
+use bytes::Bytes;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Height, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -78,10 +80,19 @@ pub struct Committer {
     tx_output: Sender<Header>,
     synchronizer: Synchronizer,
     genesis: Vec<Certificate>,
+    /// The committee information.
+    committee: Committee,
+    /// The network sender to communicate with workers.
+    network: ReliableSender,
+    /// The name of this primary.
+    name: PublicKey,
+    /// Cancel handlers for network operations.
+    cancel_handlers: Vec<CancelHandler>,
 }
 
 impl Committer {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         gc_depth: Height,
@@ -108,6 +119,10 @@ impl Committer {
                 tx_output,
                 synchronizer,
                 genesis,
+                committee,
+                network: ReliableSender::new(),
+                name,
+                cancel_handlers: Vec::new(),
             }
             .run()
             .await;
@@ -116,7 +131,7 @@ impl Committer {
 
     async fn process_commit_message(&mut self, state: &mut State, commit_message: ConsensusMessage, write_to_log: bool) {
         match commit_message.clone() {
-            ConsensusMessage::Commit{slot, view: _, qc: _, proposals: _} => {
+            ConsensusMessage::Commit { slot, view: _, qc: _, proposals: _ } => {
                 if slot <= state.last_executed_slot {
                     debug!("Already committed slot {}", slot);
                     return;
@@ -126,77 +141,116 @@ impl Committer {
                 state.log.insert(slot, commit_message);
 
                 while state.log.contains_key(&(state.last_executed_slot + 1)) {
-                    let current_commit_message = state.log.get(&(state.last_executed_slot + 1)).unwrap();
-                    debug!("Currently executing slot {:?}", state.last_executed_slot + 1);
-                    match current_commit_message {
-                        ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
-                            for (pk, proposal) in proposals {
-                                let stop_height = *state.last_executed_heights.get(pk).unwrap();
-                                // Don't execute proposals which are too old
-                                if proposal.height <= stop_height {
-                                    debug!("skipping this proposal because it's too old");
-                                    continue;
-                                }
+                    let executed_slot = state.last_executed_slot + 1;
+                    let current = state.log.get(&executed_slot).unwrap().clone();
+                    debug!("Currently executing slot {:?}", executed_slot);
+                    let mut last_header: Option<Header> = None;
 
-                                let headers = self.synchronizer.get_all_headers_for_proposal(proposal.clone(), stop_height)
-                                    .await
-                                    .expect("should have ancestors by now");
+                    if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = current {
+                        for (pk, proposal) in proposals {
+                            let stop_height = *state.last_executed_heights.get(&pk).unwrap();
+                            // Don't execute proposals which are too old
+                            if proposal.height <= stop_height {
+                                debug!("skipping this proposal because it's too old");
+                                continue;
+                            }
 
-                                // Update last executed height for the lane
-                                if proposal.height > stop_height {
-                                    state.last_executed_heights.insert(*pk, proposal.height);
-                                }
+                            let headers = self
+                                .synchronizer
+                                .get_all_headers_for_proposal(proposal.clone(), stop_height)
+                                .await
+                                .expect("should have ancestors by now");
 
-                                // Commit all of the headers  //TODO: Zip all histories for fairness
-                                for header in headers { //TODO: Iter from old to new?
-                                    if write_to_log {
-                                        info!("Committed {}", header);
-                                        debug!("Committed header payload key size {:?}", header.payload.keys().len());
-                                        #[cfg(feature = "benchmark")]
-                                        for digest in header.payload.keys() {
-                                            // NOTE: This log entry is used to compute performance.
-                                            info!("Committed {} -> {:?}", header, digest);
-                                        }
+                            // Update last executed height for the lane
+                            if proposal.height > stop_height {
+                                state.last_executed_heights.insert(pk, proposal.height);
+                            }
+
+                            // Commit all of the headers
+                            for header in headers {
+                                if write_to_log {
+                                    info!("Committed {}", header);
+                                    debug!(
+                                        "Committed header payload key size {:?}",
+                                        header.payload.keys().len()
+                                    );
+                                    #[cfg(feature = "benchmark")]
+                                    for digest in header.payload.keys() {
+                                        // NOTE: This log entry is used to compute performance.
+                                        info!("Committed {} -> {:?}", header, digest);
                                     }
-                                    debug!("Finished Commit");
-                                    // Output the block to the top-level application.
-                                    if let Err(e) = self.tx_output.send(header.clone()).await {
-                                        debug!("Failed to send block through the output channel: {}", e);
-                                    }
-                                    debug!("Finish upcall");
+                                }
+                                last_header = Some(header.clone());
+                                // Output the block to the top-level application.
+                                if let Err(e) = self.tx_output.send(header.clone()).await {
+                                    debug!("Failed to send block through the output channel: {}", e);
                                 }
                             }
-                            state.last_executed_slot += 1;
-                        },
-                        _ => {}
+                        }
                     }
-                }
 
-            },
-            _ => {},
-        };
+                    // Inform workers (best-effort) of the committed slot
+                    if let Some(h) = last_header.as_ref() {
+                        let _ = self.send_slot_committed_message(executed_slot, h).await;
+                    }
+
+                    state.last_executed_slot += 1;
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
-
+        
         loop {
             tokio::select! {
-                Some(_) = self.rx_mempool.recv() => {
-                    // Add the new certificate to the local storage.
-                    /*state.dag.entry(certificate.height()).or_insert_with(HashMap::new).insert(
-                        certificate.origin(),
-                        (certificate.digest(), certificate.clone()),
-                    );*/
+                Some(certificate) = self.rx_mempool.recv() => {
+                    
                 },
+                
+                /*Some(certificate) = self.rx_deliver.recv() => {
+                    debug!("should loopback to dag next round to include this header (when certificate header round > hash/digest last committed round)");
+                    
+                },*/
+                
                 Some((commit_message, write_to_log)) = self.rx_commit_message.recv() => {
-                    self.process_commit_message(state.borrow_mut(), commit_message, write_to_log).await;
+                    self.process_commit_message(&mut state, commit_message, write_to_log).await;
                 },
                 Some(_) = self.rx_deliver.recv() => {}
 
             }
         }
+    }
+
+    /// Send SlotCommittedMessage to workers when a slot is committed with their batches
+    async fn send_slot_committed_message(&mut self, slot: Slot, header: &Header) -> Result<(), Box<dyn std::error::Error>> {
+        // Collect all batch digests from the header
+        let all_batch_digests: Vec<Digest> = header.payload.keys().cloned().collect();
+        
+        if all_batch_digests.is_empty() {
+            return Ok(());
+        }
+        
+        // Send SlotCommittedMessage to our first worker (worker 0) with all batches
+        if let Ok(worker_info) = self.committee.worker(&self.name, &0) {
+            let batch_count = all_batch_digests.len();
+            let message = PrimaryWorkerMessage::SlotCommitted(slot, all_batch_digests);
+            let bytes = bincode::serialize(&message)
+                .map_err(|e| format!("Failed to serialize slot committed message: {}", e))?;
+
+            let address = worker_info.primary_to_worker;
+            let handler = self.network.send(address, Bytes::from(bytes)).await;
+            self.cancel_handlers.push(handler);
+            debug!("Sent SlotCommittedMessage for slot {} to worker 0 with {} batches", 
+                   slot, batch_count);
+        } else {
+            debug!("Worker 0 not found in committee for primary {}", self.name);
+        }
+        
+        Ok(())
     }
 
     /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):

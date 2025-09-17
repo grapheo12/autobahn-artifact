@@ -11,18 +11,33 @@ use network::ReliableSender;
 use network::CancelHandler;
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use primary::timer::Timer;
+use std::pin::Pin;
 
 #[cfg(test)]
 #[path = "tests/synchronizer_tests.rs"]
 pub mod synchronizer_tests;
 
+#[derive(Clone, PartialEq, std::fmt::Debug)]
+pub enum AsyncEffectType {
+    Off = 0,
+    TempBlip = 1,
+    Failure = 2,
+    Partition = 3,
+    Egress = 4,
+}
+
+fn uint_to_enum(v: u8) -> AsyncEffectType {
+    unsafe { std::mem::transmute(v) }
+}
+
 /// Resolution of the timer managing retrials of sync requests (in ms).
-const TIMER_RESOLUTION: u64 = 1_000;
+const TIMER_RESOLUTION: u64 = 100;
 
 // The `Synchronizer` is responsible to keep the worker in sync with the others.
 pub struct Synchronizer {
@@ -54,6 +69,19 @@ pub struct Synchronizer {
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
 
     cancel_handlers: HashMap<Digest, Vec<CancelHandler>>,
+    
+    // Failure simulation fields
+    simulate_asynchrony: bool,
+    asynchrony_type: VecDeque<u8>,
+    asynchrony_start: VecDeque<u64>,
+    asynchrony_duration: VecDeque<u64>,
+    affected_nodes: VecDeque<u64>,
+    keys: Vec<PublicKey>,
+    during_simulated_asynchrony: bool,
+    current_effect_type: AsyncEffectType,
+    should_simulate_failure: bool,
+    // Timers for async period transitions
+    async_timer_futures: FuturesUnordered<Pin<Box<Timer>>>,
 }
 
 impl Synchronizer {
@@ -67,9 +95,17 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        simulate_asynchrony: bool,
+        asynchrony_type: VecDeque<u8>,
+        asynchrony_start: VecDeque<u64>,
+        asynchrony_duration: VecDeque<u64>,
+        affected_nodes: VecDeque<u64>,
     ) {
         tokio::spawn(async move {
-            Self {
+            let mut keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+            keys.sort();
+            
+            let mut synchronizer = Self {
                 name,
                 id,
                 committee,
@@ -83,9 +119,70 @@ impl Synchronizer {
                 round: Round::default(),
                 pending: HashMap::new(),
                 cancel_handlers: HashMap::new(),
+                simulate_asynchrony,
+                asynchrony_type,
+                asynchrony_start,
+                asynchrony_duration,
+                affected_nodes,
+                keys,
+                during_simulated_asynchrony: false,
+                current_effect_type: AsyncEffectType::Off,
+                should_simulate_failure: false,
+                async_timer_futures: FuturesUnordered::new(),
+            };
+
+            if synchronizer.simulate_asynchrony {
+                for i in 0..synchronizer.asynchrony_start.len() {
+                    let start_offset = synchronizer.asynchrony_start[i];
+                    let end_offset = start_offset +  synchronizer.asynchrony_duration[i];
+                                
+                    let async_start = Timer::new(0, 0, start_offset);
+                    let async_end = Timer::new(0, 0, end_offset);
+
+                    synchronizer.async_timer_futures.push(Box::pin(async_start));
+                    synchronizer.async_timer_futures.push(Box::pin(async_end));
+                    
+                    let effect_type = uint_to_enum(synchronizer.asynchrony_type[i]);
+                    
+                    if effect_type == AsyncEffectType::Partition {
+                        let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
+
+                        // Figure out which partition we are in, partition_nodes indicates when the left partition ends
+                        let mut start: usize = 0;
+                        let mut end: usize = 0;
+                    
+                        // We are in the right partition
+                        if index > synchronizer.affected_nodes[i] as usize - 1 {
+                            start = synchronizer.affected_nodes[i] as usize;
+                            end = synchronizer.keys.len();
+                        
+                        } else {
+                            // We are in the left partition
+                            start = 0;
+                            end = synchronizer.affected_nodes[i] as usize;
+                        }
+
+                        // These are the nodes in our side of the partition
+                        for j in start..end {
+                            // No-op here, included for alignment with other modules that track partitions
+                            let _ = synchronizer.keys[j];
+                        }
+
+                        debug!("Synchronizer partition window configured");
+                    } else if effect_type == AsyncEffectType::Failure {
+                        // Check if this worker should simulate failure
+                        let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
+                        
+                        // Only workers for nodes below affected_nodes threshold simulate failure
+                        if index < synchronizer.affected_nodes[i] as usize {
+                            synchronizer.should_simulate_failure = true;
+                            debug!("Synchronizer will simulate failure during async period {}", i);
+                        }
+                    }
+                }
             }
-            .run()
-            .await;
+
+            synchronizer.run().await;
         });
     }
 
@@ -129,22 +226,6 @@ impl Synchronizer {
                                 continue;
                             }
 
-                            // Check if we received the batch in the meantime.
-                            match self.store.read(digest.to_vec()).await {
-                                Ok(None) => {
-                                    missing.push(digest.clone());
-                                    debug!("Requesting sync for batch {}", digest);
-                                },
-                                Ok(Some(_)) => {
-                                    debug!("already have batch {}", digest);
-                                    // The batch arrived in the meantime: no need to request it.
-                                },
-                                Err(e) => {
-                                    error!("{}", e);
-                                    continue;
-                                }
-                            }
-
                             // Add the digest to the waiter.
                             let deliver = digest.clone();
                             let (tx_cancel, rx_cancel) = channel(1);
@@ -186,7 +267,7 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _) in self.pending.values() {
+                        for (r, handler, _) in self.pending values() {
                             if r <= &gc_round {
                                 let _ = handler.send(()).await;
                             }
@@ -202,7 +283,7 @@ impl Synchronizer {
                         // We got the batch, remove it from the pending list.
                         debug!("Got from helper batch {}", digest);
                         self.pending.remove(&digest);
-                        //self.cancel_handlers.remove(&digest);
+                        //self.cancel_handlers remove(&digest);
                     },
                     Ok(None) => {
                         // The sync request for this batch has been canceled.
@@ -228,25 +309,49 @@ impl Synchronizer {
                         }
                     }
                     if !retry.is_empty() {
-                        /*let addresses = self.committee
-                            .others_workers(&self.name, &self.id)
-                            .iter().map(|(_, address)| address.worker_to_worker)
-                            .collect();
-                        let message = WorkerMessage::BatchRequest(retry, self.name);
-                        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
-                        let handler = self.network
-                            .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
-                            .await;
-                        self.cancel_handlers
-                            .entry(self.id) 
-                            .or_insert_with(Vec::new)
-                            .push(handler);*/
+                        // Check if we should drop messages during failure simulation
+                        if self.during_simulated_asynchrony && 
+                           self.current_effect_type == AsyncEffectType::Failure && 
+                           self.should_simulate_failure {
+                            debug!("Synchronizer failure simulation: dropping retry sync requests during failure period");
+                            // Don't send any retry sync requests - simulate complete failure
+                        } else {
+                            let addresses = self.committee
+                                .others_workers(&self.name, &self.id)
+                                .iter().map(|(_, address)| address.worker_to_worker)
+                                .collect();
+                            let message = WorkerMessage::BatchRequest(retry.clone(), self.name);
+                            let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+                            debug!("Sending retry sync requests for {:?}", retry);
+                            self.network
+                                .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
+                                .await;
+                        }
                     }
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
                 },
+                
+                // Handle async period timer events
+                Some((slot, view)) = self.async_timer_futures.next() => {
+                    // Toggle the async period state
+                    self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
+                    
+                    if self.during_simulated_asynchrony {
+                        // Starting a new async period - pop the next effect type
+                        if !self.asynchrony_type.is_empty() {
+                            self.current_effect_type = uint_to_enum(self.asynchrony_type.pop_front().unwrap());
+                            debug!("Synchronizer async period started with effect type: {:?}", self.current_effect_type);
+                        }
+                    } else {
+                        // Ending async period
+                        debug!("Synchronizer async period ended, effect was: {:?}", self.current_effect_type);
+                        self.current_effect_type = AsyncEffectType::Off;
+                    }
+                }
             }
         }
     }
 }
+

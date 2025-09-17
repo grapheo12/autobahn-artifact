@@ -11,19 +11,20 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use log::debug;
+use log::{debug, error, warn};
 //#[cfg(feature = "benchmark")]
 use log::info;
 use network::{ReliableSender, SimpleSender};
 use primary::{Primary, PrimaryWorkerMessage, WorkerPrimaryMessage};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, HashMap};
+use std::sync::{Arc, Mutex};
 //#[cfg(feature = "benchmark")]
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 use store::Store;
 use std::convert::TryInto as _;
 use primary::timer::Timer;
@@ -78,6 +79,10 @@ pub struct BatchMaker {
     //network: ReliableSender,
     // Currently during asynchrony
     during_simulated_asynchrony: bool,
+    // Current async effect type
+    current_effect_type: AsyncEffectType,
+    // Should simulate failure (determined at startup based on node index)
+    should_simulate_failure: bool,
     // Partition public keys
     partition_public_keys: HashSet<PublicKey>,
     // Partition queue for batch requests
@@ -86,6 +91,8 @@ pub struct BatchMaker {
     store: Store,
     // Quorum waiter
     tx_message: Sender<QuorumWaiterMessage>,
+    /// Shared map from batch digest to list of transaction IDs (client_id, counter) for reply tracking
+    batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>,
     //Simulating an async event
     pub simulate_asynchrony: bool, 
     //Type of effects: 0 for delay full async duration, 1 for partition, 2 for  failure, 3 for egress delay. Will start #type many blips.
@@ -114,6 +121,7 @@ impl BatchMaker {
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         //partition_public_keys: HashSet<PublicKey>,
         mut store: Store,
+        batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>, // shared mapping for reply tracking
         
         simulate_asynchrony: bool,
         asynchrony_type: VecDeque<u8>,
@@ -136,10 +144,13 @@ impl BatchMaker {
                 network: SimpleSender::new(),
                 //network: ReliableSender::new(),
                 during_simulated_asynchrony: false,
+                current_effect_type: AsyncEffectType::Off,
+                should_simulate_failure: false,
                 //partition_public_keys,
                 partition_public_keys: HashSet::new(),
                 partition_queue: VecDeque::new(),
                 store,
+                batch_to_transactions,
                 simulate_asynchrony,
                 asynchrony_type,
                 asynchrony_start,
@@ -156,6 +167,8 @@ impl BatchMaker {
 
     /// Main loop receiving incoming transactions and creating batches.
     async fn run(&mut self) {
+        let mut transaction_count = 0u64;
+        let mut batch_count = 0u64;
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
         
@@ -170,7 +183,9 @@ impl BatchMaker {
                 self.async_timer_futures.push(Box::pin(async_start));
                 self.async_timer_futures.push(Box::pin(async_end));
                 
-                if uint_to_enum(self.asynchrony_type[i]) == AsyncEffectType::Partition {
+                let effect_type = uint_to_enum(self.asynchrony_type[i]);
+                
+                if effect_type == AsyncEffectType::Partition {
                     self.keys.sort();
                     let index = self.keys.binary_search(&self.name).unwrap();
 
@@ -195,6 +210,16 @@ impl BatchMaker {
                     }
 
                     debug!("partition pks are {:?}", self.partition_public_keys);
+                } else if effect_type == AsyncEffectType::Failure {
+                    // Check if this worker should simulate failure
+                    self.keys.sort();
+                    let index = self.keys.binary_search(&self.name).unwrap();
+                    
+                    // Only workers for nodes below affected_nodes threshold simulate failure
+                    if index < self.affected_nodes[i] as usize {
+                        self.should_simulate_failure = true;
+                        debug!("Worker will simulate failure during async period {}", i);
+                    }
                 }
             }
         }
@@ -204,38 +229,49 @@ impl BatchMaker {
         tokio::pin!(timer1);
         let timer2 = sleep(Duration::from_secs(30));
         tokio::pin!(timer2);*/
-        let mut current_time = Instant::now();
 
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+                    transaction_count += 1;
+                    
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
-                        self.seal().await;
+                        self.seal(&mut batch_count).await;
 
-                        debug!("batch ready it took {:?} ms", current_time.elapsed().as_millis());
-                        current_time = Instant::now();
-
-                        timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                        timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    debug!("BatchMaker: max batch delay timer triggered");
+                    info!("BatchMaker: max batch delay timer triggered");
                     if !self.current_batch.is_empty() {
-                        self.seal().await;
+                        self.seal(&mut batch_count).await;
                     }
 
-                    current_time = Instant::now();
-                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(self.max_batch_delay));
                 },
 
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
-                    debug!("partition queue size is {:?}", self.partition_queue.len());
+                    
+                    if self.during_simulated_asynchrony {
+                        // Starting async period - determine effect type
+                        if !self.asynchrony_type.is_empty() {
+                            self.current_effect_type = uint_to_enum(self.asynchrony_type.pop_front().unwrap());
+                            debug!("Worker async period started with effect type: {:?}", self.current_effect_type);
+                        }
+                    } else {
+                        // Ending async period
+                        debug!("Worker async period ended, effect was: {:?}", self.current_effect_type);
+                        if self.current_effect_type == AsyncEffectType::Partition {
+                            debug!("partition queue size is {:?}", self.partition_queue.len());
+                        }
+                        self.current_effect_type = AsyncEffectType::Off;
+                    }
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
@@ -263,23 +299,44 @@ impl BatchMaker {
     }
 
     /// Seal and broadcast the current batch.
-    async fn seal(&mut self) {
+    async fn seal(&mut self, batch_count: &mut u64) {
+        *batch_count += 1;
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
-        // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
+        // Look for all txs and gather their client_id and counter.
+        // Sample txs start with 0, non-sample txs start with 1.
         #[cfg(feature = "benchmark")]
-        let tx_ids: Vec<_> = self
+        let all_tx_ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
+            .filter(|tx| tx.len() > 9 && (tx[0] == 0u8 || tx[0] == 1u8))
+            .filter_map(|tx| {
+                let tx_type = tx[0]; // 0 for sample, 1 for non-sample
+                let client_id = tx[1];
+                let counter_bytes: [u8; 8] = tx[2..10].try_into().ok()?;
+                let counter = u64::from_be_bytes(counter_bytes);
+                Some((tx_type, client_id, counter))
+            })
+            .collect();
+
+        // Extract transaction IDs for reply mapping (regardless of benchmark feature)
+        let transaction_ids: Vec<(u8, u64)> = self
+            .current_batch
+            .iter()
+            .filter(|tx| tx.len() > 9 && (tx[0] == 0u8 || tx[0] == 1u8))
+            .filter_map(|tx| {
+                let client_id = tx[1];
+                let counter_bytes: [u8; 8] = tx[2..10].try_into().ok()?;
+                let counter = u64::from_be_bytes(counter_bytes);
+                Some((client_id, counter))
+            })
             .collect();
 
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
-        let message = WorkerMessage::Batch(batch);
+        let message = WorkerMessage::Batch(batch, self.name);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]
@@ -291,13 +348,25 @@ impl BatchMaker {
                     .unwrap(),
             );
 
-            for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
+            for (tx_type, client_id, counter) in all_tx_ids {
+                if tx_type == 0u8 {
+                    // Sample transaction
+                    // NOTE: This log entry is used to compute performance.
+                    info!(
+                        "Batch {:?} contains sample tx {} from client {}",
+                        digest,
+                        counter,
+                        client_id
+                    );
+                } else {
+                    // Non-sample transaction
+                    info!(
+                        "Batch {:?} contains tx {} from client {}",
+                        digest,
+                        counter,
+                        client_id
+                    );
+                }
             }
 
             // NOTE: This log entry is used to compute performance.
@@ -312,17 +381,45 @@ impl BatchMaker {
         let bytes = Bytes::from(serialized.clone());
         let digest = Digest(Sha512::digest(&serialized).as_slice()[..32].try_into().unwrap());
 
+        // Store the batch-to-transaction mapping for reply tracking
+        self.batch_to_transactions.lock().unwrap().insert(digest.clone(), transaction_ids);
+
         // Store the batch.
         self.store.write(digest.to_vec(), serialized.clone()).await;
-        self.tx_batch.send(serialized.clone()).await.expect("Failed to deliver batch");
+        
+        // Send batch to processor
+        if let Err(e) = self.tx_batch.send(serialized.clone()).await {
+            error!("BatchMaker: Failed to send batch to processor: {}", e);
+            panic!("BatchMaker channel to processor is closed");
+        }
         if self.during_simulated_asynchrony {
-            debug!("BatchMaker: Simulated asynchrony enabled. Only sending to partitioned keys from broadcast");
-            let new_addresses: Vec<_> = self.workers_addresses.iter().filter(|(pk, _)| self.partition_public_keys.contains(pk)).map(|(_, addr)| addr).cloned().collect();
-            //let (_, addresses) = new_addresses.iter().cloned().unzip();
-            //debug!("addresses is {:?}", new_addresses);
-            self.partition_queue.push_back(message);
-            debug!("partition queue size is {:?}", self.partition_queue.len());
-            self.network.broadcast(new_addresses, bytes).await; 
+            match self.current_effect_type {
+                AsyncEffectType::Failure => {
+                    // During failure, drop all outgoing messages if this worker should fail
+                    if self.should_simulate_failure {
+                        debug!("Worker failure simulation: dropping batch during failure period");
+                        // Don't broadcast anything - simulate complete failure
+                    } else {
+                        // This worker is not affected by failure, send normally
+                        let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+                        self.network.broadcast(addresses, bytes).await;
+                    }
+                },
+                AsyncEffectType::Partition => {
+                    debug!("BatchMaker: Simulated partition enabled. Only sending to partitioned keys from broadcast");
+                    let new_addresses: Vec<_> = self.workers_addresses.iter().filter(|(pk, _)| self.partition_public_keys.contains(pk)).map(|(_, addr)| addr).cloned().collect();
+                    //let (_, addresses) = new_addresses iter().cloned().unzip();
+                    //debug!("addresses is {:?}", new_addresses);
+                    self.partition_queue.push_back(message);
+                    debug!("partition queue size is {:?}", self.partition_queue.len());
+                    self.network.broadcast(new_addresses, bytes).await; 
+                },
+                _ => {
+                    // For other async types, send normally (could be extended for other effects)
+                    let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+                    self.network.broadcast(addresses, bytes).await;
+                }
+            }
         } else {
             //debug!("sending batch normally");
             let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
@@ -351,3 +448,4 @@ impl BatchMaker {
             .expect("Failed to deliver batch");*/
     }
 }
+

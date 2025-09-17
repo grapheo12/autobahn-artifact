@@ -57,6 +57,7 @@ pub trait Export: Serialize {
 
 pub type Stake = u32;
 pub type WorkerId = u32;
+pub type ClientId = u8;
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
@@ -186,6 +187,12 @@ pub struct PrimaryAddresses {
 }
 
 #[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
+pub struct ClientAddresses {
+    /// Address to receive transaction replies from workers (WAN).
+    pub replies: SocketAddr,
+}
+
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
 pub struct WorkerAddresses {
     /// Address to receive client transactions (WAN).
     pub transactions: SocketAddr,
@@ -199,6 +206,9 @@ pub struct WorkerAddresses {
 pub struct Authority {
     /// The voting power of this authority.
     pub stake: Stake,
+    #[serde(default)]
+    /// An optional deterministic id for client mapping.
+    pub id: usize,
     /// The network addresses of the consensus protocol.
     pub consensus: ConsensusAddresses,
     /// The network addresses of the primary.
@@ -210,6 +220,9 @@ pub struct Authority {
 #[derive(Clone, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    #[serde(default)]
+    /// Map of clients' id and their network addresses.
+    pub clients: HashMap<ClientId, ClientAddresses>,
     //pub id_map: HashMap<PublicKey, u64>, //position 
 }
 
@@ -220,11 +233,19 @@ impl Committee {
         Self {
             authorities: info
                 .into_iter()
-                .map(|(name, stake, address)| {
-                    let authority = Authority { stake, consensus: ConsensusAddresses { consensus_to_consensus: address }, primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address }, workers: HashMap::new() };
+                .enumerate()
+                .map(|(idx, (name, stake, address))| {
+                    let authority = Authority {
+                        stake,
+                        id: idx,
+                        consensus: ConsensusAddresses { consensus_to_consensus: address },
+                        primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address },
+                        workers: HashMap::new(),
+                    };
                     (name, authority)
                 })
                 .collect(),
+            clients: HashMap::new(),
         }
     }
 
@@ -360,6 +381,32 @@ impl Committee {
             .filter(|(name, _)| name != &myself)
             .map(|(name, x)| (*name, x.consensus.consensus_to_consensus))
             .collect()
+    }
+
+    /// Returns the addresses of a specific client.
+    pub fn client(&self, id: &ClientId) -> Result<ClientAddresses, ConfigError> {
+        self.clients
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ConfigError::UnknownWorker(*id as u32))
+    }
+
+    /// Returns the addresses of all clients.
+    pub fn all_clients(&self) -> Vec<(ClientId, ClientAddresses)> {
+        self.clients
+            .iter()
+            .map(|(id, addresses)| (*id, addresses.clone()))
+            .collect()
+    }
+
+    /// Add a client to the committee (for dynamic client registration).
+    pub fn add_client(&mut self, id: ClientId, addresses: ClientAddresses) {
+        self.clients.insert(id, addresses);
+    }
+
+    /// Remove a client from the committee.
+    pub fn remove_client(&mut self, id: &ClientId) -> Option<ClientAddresses> {
+        self.clients.remove(id)
     }
 }
 
