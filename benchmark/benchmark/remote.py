@@ -264,13 +264,20 @@ class Bench:
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
+                client_id = (i * len(addresses)) + id
+                reply_port = self.settings.base_port + 6000 + client_id
+                reply_addr = f'{host}:{reply_port}'
                 cmd = CommandMaker.run_client(
-                    address,
+                    client_id,
+                    reply_addr,
+                    PathMaker.committee_file(),
+                    PathMaker.key_file(i),
+                    PathMaker.db_path(i, id),
                     bench_parameters.tx_size,
                     rate_share,
-                    [x for y in workers_addresses for _, x in y]
+                    1,
+                    1,
                 )
-                print(cmd)
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 

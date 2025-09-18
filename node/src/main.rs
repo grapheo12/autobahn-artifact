@@ -2,6 +2,9 @@
 #![allow(unused_variables)]
 #![allow(unused_imports)]
 // Copyright(C) Facebook, Inc. and its affiliates.
+mod client;
+mod reply_processor;
+mod transaction_sender;
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
@@ -9,6 +12,7 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::SignatureService;
 use env_logger::Env;
+use std::net::SocketAddr;
 use primary::Header;
 use primary::Primary;
 use store::Store;
@@ -41,8 +45,18 @@ async fn main() -> Result<()> {
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
                     SubCommand::with_name("worker")
-                        .about("Run a single worker")
-                        .args_from_usage("--id=<INT> 'The worker id'"),
+                .about("Run a single worker")
+                .args_from_usage("--id=<INT> 'The worker id'"),
+                )
+                .subcommand(
+                    SubCommand::with_name("client")
+                        .about("Run a client")
+                        .args_from_usage("--client-id=<INT> 'The client id (0-255)'")
+                        .args_from_usage("--reply-addr=<ADDR> 'The address for receiving replies'")
+                        .args_from_usage("--size=[INT] 'The size of each transaction in bytes (default: 512)'")
+                        .args_from_usage("--rate=[INT] 'The rate (txs/s) at which to send transactions (default: 1000)'")
+                        .args_from_usage("--workers=[INT] 'The number of workers to send to (default: 1)'")
+                        .args_from_usage("--threshold=[INT] 'Number of confirmations required (default: 1)'")
                 )
                 .setting(AppSettings::SubcommandRequiredElseHelp),
         )
@@ -166,6 +180,58 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
             Worker::spawn(keypair.name, id, committee, parameters, store);
+        }
+        ("client", Some(sub_matches)) => {
+            // Client arguments (keys and store are accepted but not required by the client logic)
+            let client_id = sub_matches
+                .value_of("client-id")
+                .unwrap()
+                .parse::<u8>()
+                .context("The client ID must be between 0 and 255")?;
+
+            let reply_addr = sub_matches
+                .value_of("reply-addr")
+                .unwrap()
+                .parse::<SocketAddr>()
+                .context("Invalid reply address format")?;
+
+            let size = sub_matches
+                .value_of("size")
+                .unwrap_or("512")
+                .parse::<usize>()
+                .context("Transaction size must be a positive integer")?;
+
+            let rate = sub_matches
+                .value_of("rate")
+                .unwrap_or("1000")
+                .parse::<u64>()
+                .context("Transaction rate must be a positive integer")?;
+
+            let workers = sub_matches
+                .value_of("workers")
+                .unwrap_or("1")
+                .parse::<usize>()
+                .context("Worker count must be a positive integer")?;
+
+            let threshold = sub_matches
+                .value_of("threshold")
+                .unwrap_or("1")
+                .parse::<usize>()
+                .context("Threshold must be a positive integer")?;
+
+            let params = client::ClientParameters {
+                transaction_size: size,
+                transaction_rate: rate,
+                worker_count: workers,
+                threshold,
+            };
+
+            client::Client::spawn(client_id, committee, params, reply_addr);
+
+            // Keep the client alive
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
         }
         _ => unreachable!(),
     }
