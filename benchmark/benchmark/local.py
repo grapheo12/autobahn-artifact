@@ -1,6 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 import subprocess
-from math import ceil
+from math import ceil, floor
 from os.path import basename, splitext
 from time import sleep
 
@@ -11,7 +11,7 @@ from benchmark.utils import Print, BenchError, PathMaker
 
 
 class LocalBench:
-    BASE_PORT = 3000
+    BASE_PORT = 2000
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
         try:
@@ -25,7 +25,7 @@ class LocalBench:
 
     def _background_run(self, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'{command} 2> {log_file}'
+        cmd = f'{command} > {log_file} 2>&1'
         subprocess.run(['tmux', 'new', '-d', '-s', name, cmd], check=True)
 
     def _kill_nodes(self):
@@ -48,16 +48,12 @@ class LocalBench:
 
             # Cleanup all files.
             cmd = f'{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}'
-            print('before run')
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
-            print('after run')
             sleep(0.5)  # Removing the store may take time.
 
-            print('past cleanup')
             # Recompile the latest code.
             cmd = CommandMaker.compile().split()
             subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
-            print('past compiled')
 
             # Create alias for the client and nodes binary.
             cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
@@ -70,29 +66,16 @@ class LocalBench:
                 cmd = CommandMaker.generate_key(filename).split()
                 subprocess.run(cmd, check=True)
                 keys += [Key.from_file(filename)]
-            print('past keys')
+
 
             names = [x.name for x in keys]
+            ids = [i for i in range(len(keys))]
+            
             #print('num workers', self.workers)
-            committee = LocalCommittee(names, self.BASE_PORT, self.workers)
+            committee = LocalCommittee(names, ids,self.BASE_PORT, self.workers)
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())
-
-            # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / committee.workers())
-            for i, addresses in enumerate(workers_addresses):
-                for (id, address) in addresses:
-                    cmd = CommandMaker.run_client(
-                        address,
-                        self.tx_size,
-                        rate_share,
-                        [x for y in workers_addresses for _, x in y]
-                    )
-                    log_file = PathMaker.client_log_file(i, id)
-                    self._background_run(cmd, log_file)
-            print('past workers')
 
             # Run the primaries (except the faulty ones).
             for i, address in enumerate(committee.primary_addresses(self.faults)):
@@ -108,6 +91,7 @@ class LocalBench:
                 self._background_run(cmd, log_file)
 
             # Run the workers (except the faulty ones).
+            workers_addresses = committee.workers_addresses(self.faults)
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_worker(
@@ -120,6 +104,37 @@ class LocalBench:
                     )
                     log_file = PathMaker.worker_log_file(i, id)
                     self._background_run(cmd, log_file)
+
+            # Wait for workers to be ready before starting clients
+            Print.info('Waiting for workers to start...')
+            sleep(2)
+
+            # Run the clients (after workers are ready).
+            client_addresses = committee.client_addresses()
+            rate_share = ceil(rate / committee.workers())
+            f = floor((nodes - 1) / 3)
+            Print.info(f"f: {f}")
+            client_id = 0
+            for i, addresses in enumerate(workers_addresses):
+                for (id, address) in addresses:
+                    # Get the corresponding client reply address
+                    if client_id < len(client_addresses):
+                        reply_addr = client_addresses[client_id]
+                        cmd = CommandMaker.run_client(
+                            client_id,
+                            reply_addr,
+                            PathMaker.committee_file(),
+                            PathMaker.key_file(i),
+                            f'.db-client-{client_id}',
+                            self.tx_size,
+                            rate_share,
+                            self.worker_fault_tolerance,
+                            threshold=f+1
+                        )
+                        log_file = PathMaker.client_log_file(i, id)
+                        print(f"Client {client_id} command: {cmd}")
+                        self._background_run(cmd, log_file)
+                    client_id += 1
 
             # Wait for all transactions to be processed.
             Print.info(f'Running benchmark ({self.duration} sec)...')

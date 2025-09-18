@@ -45,7 +45,7 @@ class Committee:
         }
     '''
 
-    def __init__(self, addresses, base_port):
+    def __init__(self, ids, addresses, base_port):
         ''' The `addresses` field looks as follows:
             { 
                 "name": ["host", "host", ...],
@@ -65,6 +65,12 @@ class Committee:
 
         port = base_port
         self.json = {'authorities': OrderedDict()}
+        id_counter = 0
+
+        # Store original addresses for client generation later
+        original_addresses = OrderedDict()
+        for name, hosts in addresses.items():
+            original_addresses[name] = list(hosts)  # Make a copy
 
         for name, hosts in addresses.items():
             host = hosts.pop(0)
@@ -90,10 +96,27 @@ class Committee:
 
             self.json['authorities'][name] = {
                 'stake': 1,
+                'id': ids[id_counter],
                 'consensus': consensus_addr,
                 'primary': primary_addr,
                 'workers': workers_addr
             }
+            id_counter += 1
+
+        # Add client addresses (one client per worker across all nodes)
+        self.json['clients'] = OrderedDict()
+        client_id = 0
+        for name, hosts in original_addresses.items():
+            # Use the primary host for all clients of this node
+            primary_host = hosts[0]
+            # Number of workers for this node (excluding primary)
+            num_workers = len(hosts) - 1
+            for worker_idx in range(num_workers):
+                self.json['clients'][str(client_id)] = {
+                    'replies': f'{primary_host}:{port}'
+                }
+                port += 1
+                client_id += 1
 
     def primary_addresses(self, faults=0):
         ''' Returns an ordered list of primaries' addresses. '''
@@ -115,6 +138,12 @@ class Committee:
                 authority_addresses += [(id, worker['transactions'])]
             addresses.append(authority_addresses)
         return addresses
+
+    def client_addresses(self):
+        ''' Returns an ordered list of client reply addresses. '''
+        if 'clients' not in self.json:
+            return []
+        return [client['replies'] for client in self.json['clients'].values()]
 
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''
@@ -165,13 +194,13 @@ class Committee:
 
 
 class LocalCommittee(Committee):
-    def __init__(self, names, port, workers):
+    def __init__(self, names, ids, port, workers):
         assert isinstance(names, list)
         assert all(isinstance(x, str) for x in names)
         assert isinstance(port, int)
         assert isinstance(workers, int) and workers > 0
         addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
-        super().__init__(addresses, port)
+        super().__init__(ids, addresses, port)
 
 
 class NodeParameters:
@@ -218,6 +247,8 @@ class BenchParameters:
             self.rate = [int(x) for x in rate]
 
             self.workers = int(json['workers'])
+            
+            self.worker_fault_tolerance = int(json.get('worker_fault_tolerance', 1))
 
             if 'collocate' in json:
                 self.collocate = bool(json['collocate'])

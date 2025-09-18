@@ -46,14 +46,21 @@ class CommandMaker:
                 f'--store {store} --parameters {parameters} worker --id {id}')
 
     @staticmethod
-    def run_client(address, size, rate, nodes):
-        assert isinstance(address, str)
+    def run_client(client_id, reply_addr, committee, keys, store, size, rate, workers, threshold=1):
+        assert isinstance(client_id, int) and 0 <= client_id <= 255
+        assert isinstance(reply_addr, str)
+        assert isinstance(committee, str)
+        assert isinstance(keys, str)
+        assert isinstance(store, str)
         assert isinstance(size, int) and size > 0
         assert isinstance(rate, int) and rate >= 0
-        assert isinstance(nodes, list)
-        assert all(isinstance(x, str) for x in nodes)
-        nodes = f'--nodes {" ".join(nodes)}' if nodes else ''
-        return f'./benchmark_client {address} --size {size} --rate {rate} {nodes}'
+        assert isinstance(workers, int) and workers > 0
+        assert isinstance(threshold, int) and threshold > 0
+        return (
+            f'./node -vvv run --keys {keys} --committee {committee} --store {store} '
+            f'client --client-id {client_id} --reply-addr {reply_addr} --size {size} '
+            f'--rate {rate} --workers {workers} --threshold {threshold}'
+        )
 
     @staticmethod
     def kill():

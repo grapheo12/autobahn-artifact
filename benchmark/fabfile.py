@@ -143,15 +143,15 @@ def remote(ctx, debug=True):
         'sync_retry_nodes': 4,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 200,  # ms
-        'use_optimistic_tips': False,
+        'use_optimistic_tips': True,
         'use_parallel_proposals': True,
-        'k': 1,
+        'k': 4,
         'use_fast_path': True,
         'fast_path_timeout': 200,
         'use_ride_share': False,
         'car_timeout': 2000,
 
-        'simulate_asynchrony': True,
+        'simulate_asynchrony': False,
         'asynchrony_type': [3],
 
         'asynchrony_start': [10_000], #ms
