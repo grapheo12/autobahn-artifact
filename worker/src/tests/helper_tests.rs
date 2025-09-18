@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{batch_digest, committee_with_base_port, keys, listener, serialized_batch};
+use std::collections::VecDeque;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
@@ -22,7 +23,19 @@ async fn batch_reply() {
         .await;
 
     // Spawn an `Helper` instance.
-    Helper::spawn(id, committee.clone(), store, rx_request);
+    let name = *committee.authorities.keys().next().unwrap();
+    Helper::spawn(
+        name,
+        id,
+        committee.clone(),
+        store,
+        rx_request,
+        false,
+        VecDeque::new(),
+        VecDeque::new(),
+        VecDeque::new(),
+        VecDeque::new(),
+    );
 
     // Spawn a listener to receive the batch reply.
     let address = committee.worker(&requestor, &id).unwrap().worker_to_worker;

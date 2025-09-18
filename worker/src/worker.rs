@@ -135,7 +135,10 @@ impl Worker {
         Receiver::spawn(
             address,                                    //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer, tx_reply_sender }, //handler for received Primary messages, forwards them to synchronizer
+            PrimaryReceiverHandler { 
+                tx_synchronizer,
+                tx_reply_sender,
+            }, //handler for received Primary messages, routes to synchronizer or reply sender
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -148,7 +151,7 @@ impl Worker {
             self.parameters.gc_depth,
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
-            rx_synchronizer,
+            /* rx_message */ rx_synchronizer,
             self.parameters.simulate_asynchrony,
             self.parameters.asynchrony_type.clone(),
             self.parameters.asynchrony_start.clone(),
@@ -156,12 +159,8 @@ impl Worker {
             self.parameters.affected_nodes.clone(),
         );
 
-        // Spawn ReplySender to send replies back to clients after commits
-        ReplySender::spawn(
-            rx_reply_sender,
-            self.store.clone(),
-            self.committee.clone(),
-        );
+        // Spawn ReplySender component to handle SlotCommittedMessage
+        ReplySender::spawn(rx_reply_sender, self.store.clone(), self.committee.clone());
 
         info!(
             "Worker {} listening to primary messages on {}",
@@ -169,13 +168,13 @@ impl Worker {
         );
     }
 
-    /// Spawn all tasks responsible to handle client transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>, batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>) {
+    /// Spawn all tasks responsible to handle clients transactions.
+    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>, batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>)  {  //tx_primary: channel between processor and PrimaryConnector
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
 
-        // Receive incoming client transactions.
+        // We first receive clients' transactions from the network.
         let mut address = self
             .committee
             .worker(&self.name, &self.id)
@@ -183,11 +182,8 @@ impl Worker {
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
-            address,                     //socket to receive Client messages from
-            /* handler */
-            TxReceiverHandler {          //handler for received Client messages, forwards them to batch maker
-                tx_batch_maker,          //sender channel to connect to batch maker
-            },
+            address,                                            //socket to receive Client messages from
+            /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
         );
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
@@ -265,10 +261,16 @@ impl Worker {
 
         // The `Helper` is dedicated to reply to batch requests from other workers.
         Helper::spawn(
+            self.name,
             self.id,
             self.committee.clone(),
             self.store.clone(),
-            /* rx_request */ rx_helper,
+            /* rx_request */ rx_helper,   //receiver channel to connect to WorkerReceiverHandler
+            self.parameters.simulate_asynchrony,
+            self.parameters.asynchrony_type.clone(),
+            self.parameters.asynchrony_start.clone(),
+            self.parameters.asynchrony_duration.clone(),
+            self.parameters.affected_nodes.clone(),
         );
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
