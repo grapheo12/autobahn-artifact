@@ -34,7 +34,7 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples \
+        self.size, self.rate, self.start, misses, self.sent_samples, self.client_commits, self.all_sent_transactions \
             = zip(*results)
         self.misses = sum(misses)
 
@@ -54,7 +54,7 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips = zip(*results)
+        sizes, self.received_samples, self.all_received_transactions, workers_ips = zip(*results)
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
@@ -89,10 +89,23 @@ class LogParser:
 
         misses = len(findall(r'rate too high', log))
 
-        tmp = findall(r'\[(.*Z) .* sample transaction (\d+)', log)
-        samples = {int(s): self._to_posix(t) for t, s in tmp}
+        tmp = findall(r'\[(.*Z) .* sending sample transaction (\d+) from client (\d+)', log)
+        samples = {(int(s), int(c)): self._to_posix(t) for t, s, c in tmp}
 
-        return size, rate, start, misses, samples
+        # Parse regular transaction sends
+        tmp = findall(r'\[(.*Z) .* sending regular transaction (\d+) from client (\d+)', log)
+        regular_sends = {(int(s), int(c)): self._to_posix(t) for t, s, c in tmp}
+
+        # Combine sample and regular transaction send times
+        all_sends = {}
+        all_sends.update(samples)
+        all_sends.update(regular_sends)
+
+        # Parse transaction commits - extract both client_id and transaction counter
+        tmp = findall(r'\[(.*Z) .* Client (\d+) transaction (\d+) committed', log)
+        commits = {(int(tx_counter), int(client_id)): self._to_posix(t) for t, client_id, tx_counter in tmp}
+
+        return size, rate, start, misses, samples, commits, all_sends
 
     def _parse_primaries(self, log):
         if search(r'(?:panicked|Error)', log) is not None:
@@ -144,12 +157,17 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains (\d+) B', log)
         sizes = {d: int(s) for d, s in tmp}
 
-        tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
-        samples = {int(s): d for d, s in tmp}
+        # Extract sample transactions for latency measurement
+        tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+) from client (\d+)', log)
+        samples = {(int(s), int(c)): d for d, s, c in tmp}
+
+        # Extract all transactions (both sample and non-sample) for throughput calculation
+        tmp_all = findall(r'Batch ([^ ]+) contains (?:sample )?tx (\d+) from client (\d+)', log)
+        all_transactions = {(int(s), int(c)): d for d, s, c in tmp_all}
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        return sizes, samples, ip
+        return sizes, samples, all_transactions, ip
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
@@ -160,7 +178,16 @@ class LogParser:
             return 0, 0, 0
         start, end = min(self.proposals.values()), max(self.commits.values())
         duration = end - start
-        bytes = sum(self.sizes.values())
+        
+        # Count unique transactions across all workers
+        unique_transactions = set()
+        for received in self.all_received_transactions:
+            for tx_id, batch_id in received.items():
+                if batch_id in self.commits:
+                    unique_transactions.add(tx_id)
+
+        unique_tx_count = len(unique_transactions)
+        bytes = unique_tx_count * self.size[0]
         bps = bytes / duration
         tps = bps / self.size[0]
         return tps, bps, duration
@@ -174,34 +201,113 @@ class LogParser:
             return 0, 0, 0
         start, end = min(self.start), max(self.commits.values())
         duration = end - start
-        bytes = sum(self.sizes.values())
+        
+        # Count unique transactions across all workers
+        unique_transactions = set()
+        for received in self.all_received_transactions:
+            for tx_id, batch_id in received.items():
+                if batch_id in self.commits:
+                    unique_transactions.add(tx_id)
+
+        unique_tx_count = len(unique_transactions)
+        print('Num unique transactions committed: ', unique_tx_count)
+        bytes = unique_tx_count * self.size[0]
         bps = bytes / duration
         tps = bps / self.size[0]
         return tps, bps, duration
 
     def _end_to_end_latency(self):
-        latency = []
+        sample_latency = []
+        all_latency = []
         list_latencies = []
         first_start = 0
         set_first = True
-        for sent, received in zip(self.sent_samples, self.received_samples):
-            for tx_id, batch_id in received.items():
-                if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
-                    start = sent[tx_id]
-                    end = self.commits[batch_id]
-                    if set_first:
-                        first_start = start
-                        first_end = end
-                        set_first = False
-                    latency += [end-start]
-                    list_latencies += [(start-first_start, end-first_start, end-start)]
+        
+        # Create a combined sent samples dict from all clients (for mean calculation)
+        all_sent_samples = {}
+        for sent in self.sent_samples:
+            all_sent_samples.update(sent)
+        
+        # Create a combined all transactions dict from all clients (for percentiles)
+        all_sent_transactions = {}
+        for sent in self.all_sent_transactions:
+            all_sent_transactions.update(sent)
+        
+        # Create a combined client commits dict from all clients
+        all_client_commits = {}
+        for commits in self.client_commits:
+            all_client_commits.update(commits)
+
+        print('Num sent samples: ', len(all_sent_samples))
+        print('Num sent transactions: ', len(all_sent_transactions))
+        print('Num client commits: ', len(all_client_commits))
+
+        # Calculate latency for sample transactions (for mean)
+        for tx_id in all_sent_samples:
+            if tx_id in all_client_commits:  # tx_id is (counter, client_id)
+                send_time = all_sent_samples[tx_id]
+                commit_time = all_client_commits[tx_id]
+                tx_latency = commit_time - send_time
+
+                if first_start == 0 or send_time < first_start:
+                    first_start = send_time
+
+                sample_latency.append(tx_latency)
+                list_latencies.append((send_time - first_start, commit_time - first_start, tx_latency))
+            else:
+                print('tx_id not in all_client_commits: ', tx_id)
+
+        # Calculate latency for all transactions (for percentiles)
+        for tx_id in all_sent_transactions:
+            if tx_id in all_client_commits:  # tx_id is (counter, client_id)
+                send_time = all_sent_transactions[tx_id]
+                commit_time = all_client_commits[tx_id]
+                tx_latency = commit_time - send_time
+
+                all_latency.append(tx_latency)
+
+        print('Num sample latencies: ', len(sample_latency))
+        print('Num all latencies: ', len(all_latency))
 
         list_latencies.sort(key=lambda tup: tup[0])
         with open('latencies.txt', 'w') as f:
             for line in list_latencies:
                 f.write(str(line[0]) + ',' + str(line[1]) + ',' + str((line[2])) + '\n')
-        return mean(latency) if latency else 0
+        
+        # Calculate mean and percentiles
+        mean_latency = mean(sample_latency) if sample_latency else 0
+
+        if all_latency:
+            sorted_latency = sorted(all_latency)
+            n = len(sorted_latency)
+
+            # Calculate percentiles
+            p50_idx = int(n * 0.50)
+            p95_idx = int(n * 0.95)
+            p99_idx = int(n * 0.99)
+            p999_idx = int(n * 0.999)
+
+            # Handle edge cases for small sample sizes
+            p50 = sorted_latency[min(p50_idx, n-1)]
+            p95 = sorted_latency[min(p95_idx, n-1)]
+            p99 = sorted_latency[min(p99_idx, n-1)]
+            p999 = sorted_latency[min(p999_idx, n-1)]
+
+            return {
+                'mean': mean_latency,
+                'p50': p50,
+                'p95': p95,
+                'p99': p99,
+                'p999': p999
+            }
+        else:
+            return {
+                'mean': mean_latency,
+                'p50': 0,
+                'p95': 0,
+                'p99': 0,
+                'p999': 0
+            }
 
     def result(self):
         #timeout_delay = self.configs[0]['timeout_delay']
@@ -216,7 +322,12 @@ class LogParser:
         consensus_latency = self._consensus_latency() * 1_000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency = self._end_to_end_latency() * 1_000
+        latency_stats = self._end_to_end_latency()
+        end_to_end_latency = latency_stats['mean'] * 1_000
+        end_to_end_p50 = latency_stats['p50'] * 1_000
+        end_to_end_p95 = latency_stats['p95'] * 1_000
+        end_to_end_p99 = latency_stats['p99'] * 1_000
+        end_to_end_p999 = latency_stats['p999'] * 1_000
 
         return (
             '\n'
@@ -248,7 +359,11 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency (mean): {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency (P50): {round(end_to_end_p50):,} ms\n'
+            f' End-to-end latency (P95): {round(end_to_end_p95):,} ms\n'
+            f' End-to-end latency (P99): {round(end_to_end_p99):,} ms\n'
+            f' End-to-end latency (P99.9): {round(end_to_end_p999):,} ms\n'
             '-----------------------------------------\n'
         )
 
