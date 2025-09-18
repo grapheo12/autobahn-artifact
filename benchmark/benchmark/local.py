@@ -70,9 +70,8 @@ class LocalBench:
 
             names = [x.name for x in keys]
             ids = [i for i in range(len(keys))]
-            
             #print('num workers', self.workers)
-            committee = LocalCommittee(names, ids,self.BASE_PORT, self.workers)
+            committee = LocalCommittee(names, ids, self.BASE_PORT, self.workers)
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())

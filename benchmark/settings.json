@@ -1,19 +1,21 @@
 {
     "key": {
-        "name": "gcp",
-        "path": "<KEY_PATH>"
+        "name": "",
+        "path": "/home/ubuntu/.ssh/local-to-control-machine.pem"
     },
     "port": 5000,
     "repo": {
-        "name": "autobahn-artifact",
-        "url": "https://github.com/neilgiri/autobahn-artifact.git",
-        "branch": "autobahn-blips"
+        "name": "ambulance",
+        "url": "https://github.com/neilgiri/ambulance.git",
+        "branch": "ambulance-blips"
     },
     "project_id": "<PROJECT_ID>",
-    "username": "<USERNAME>",
+    "username": "ubuntu",
     "instances": {
-        "type": "t2d-standard-4",
-        "regions": ["us-east1-b", "us-east5-a", "us-west1-b", "us-west4-a"],
-        "templates": ["projects/<PROJECT_ID>/regions/us-east1/instanceTemplates/<TEMPLATE_NAME>", "projects/<PROJECT_ID>/regions/us-east5/instanceTemplates<TEMPLATE_NAME>", "projects/<PROJECT_ID>/regions/us-west1/instanceTemplates/<TEMPLATE_NAME>","projects/<PROJECT_ID>/regions/us-west4/instanceTemplates/<TEMPLATE_NAME>"]
+        "type": "m5a.xlarge",
+        "regions": ["us-east-1"],
+        "templates": ["ambulance-node-template"],
+        "template_ids": ["lt-0117a53d9a3949716"],
+        "template_versions": ["5"]
     }
 }

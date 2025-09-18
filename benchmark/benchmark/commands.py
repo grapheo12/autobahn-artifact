@@ -56,11 +56,7 @@ class CommandMaker:
         assert isinstance(rate, int) and rate >= 0
         assert isinstance(workers, int) and workers > 0
         assert isinstance(threshold, int) and threshold > 0
-        return (
-            f'./node -vvv run --keys {keys} --committee {committee} --store {store} '
-            f'client --client-id {client_id} --reply-addr {reply_addr} --size {size} '
-            f'--rate {rate} --workers {workers} --threshold {threshold}'
-        )
+        return f'./node -vvv run --keys {keys} --committee {committee} --store {store} client --client-id {client_id} --reply-addr {reply_addr} --size {size} --rate {rate} --workers {workers} --threshold {threshold}'
 
     @staticmethod
     def kill():
