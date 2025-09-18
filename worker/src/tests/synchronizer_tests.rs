@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{batch_digest, committee_with_base_port, keys, listener};
+use std::collections::VecDeque;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
@@ -28,6 +29,11 @@ async fn synchronize() {
         /* sync_retry_delay */ 1_000_000, // Ensure it is not triggered.
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
+        false,
+        VecDeque::new(),
+        VecDeque::new(),
+        VecDeque::new(),
+        VecDeque::new(),
     );
 
     // Spawn a listener to receive our batch requests.
@@ -38,8 +44,9 @@ async fn synchronize() {
     let serialized = bincode::serialize(&message).unwrap();
     let handle = listener(address, Some(Bytes::from(serialized)));
 
-    // Send a sync request.
-    let message = PrimaryWorkerMessage::Synchronize(missing, target);
+    // Send a sync request with worker_id.
+    let missing_with_worker_id = missing.into_iter().map(|digest| (digest, 0)).collect();
+    let message = PrimaryWorkerMessage::Synchronize(missing_with_worker_id, target);
     tx_message.send(message).await.unwrap();
 
     // Ensure the target receives the sync request.

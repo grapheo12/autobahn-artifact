@@ -240,7 +240,11 @@ impl HeaderWaiter {
                                         .primary_to_worker;
                                     debug!("Sent syncbatches message for height {}, digests {:?}", round, digests);
                                     
-                                    let message = PrimaryWorkerMessage::Synchronize(digests, author);
+                                    let digests_with_worker: Vec<_> = digests
+                                        .into_iter()
+                                        .map(|digest| (digest, worker_id))
+                                        .collect();
+                                    let message = PrimaryWorkerMessage::Synchronize(digests_with_worker, author);
                                     let bytes = bincode::serialize(&message)
                                         .expect("Failed to serialize batch sync request");
                                     let handler = self.network.send(address, Bytes::from(bytes)).await;

@@ -17,7 +17,7 @@ def local(ctx, debug=True):
         'nodes': 4,
         'workers': 1,
         'worker_fault_tolerance': 2,  # Number of workers each client sends to
-        'rate': 10_000,
+        'rate': 4_000,
         'tx_size': 512,
         'duration': 20,
 
@@ -28,7 +28,7 @@ def local(ctx, debug=True):
         'partition_nodes': 1,
     }
     node_params = {
-        'timeout_delay': 1_000,  # ms
+        'timeout_delay': 2_000,  # ms
         'header_size': 32,  # bytes
         'max_header_delay': 50,  # ms
         'gc_depth': 50,  # rounds
@@ -45,11 +45,11 @@ def local(ctx, debug=True):
         'car_timeout': 200,
         'start_slot_rounds': 1,
 
-        'simulate_asynchrony': False,
+        'simulate_asynchrony': True,
         'asynchrony_type': [2],
 
         'asynchrony_start': [10_000], #ms
-        'asynchrony_duration': [10_000], #ms
+        'asynchrony_duration': [2_000], #ms
         'affected_nodes': [1],
         'egress_penalty': 50, #ms
 

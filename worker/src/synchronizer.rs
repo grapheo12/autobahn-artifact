@@ -130,50 +130,13 @@ impl Synchronizer {
                 should_simulate_failure: false,
                 async_timer_futures: FuturesUnordered::new(),
             };
-
+            
+            // Determine if this worker should simulate failure
             if synchronizer.simulate_asynchrony {
                 for i in 0..synchronizer.asynchrony_start.len() {
-                    let start_offset = synchronizer.asynchrony_start[i];
-                    let end_offset = start_offset +  synchronizer.asynchrony_duration[i];
-                                
-                    let async_start = Timer::new(0, 0, start_offset);
-                    let async_end = Timer::new(0, 0, end_offset);
-
-                    synchronizer.async_timer_futures.push(Box::pin(async_start));
-                    synchronizer.async_timer_futures.push(Box::pin(async_end));
-                    
                     let effect_type = uint_to_enum(synchronizer.asynchrony_type[i]);
-                    
-                    if effect_type == AsyncEffectType::Partition {
+                    if effect_type == AsyncEffectType::Failure {
                         let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
-
-                        // Figure out which partition we are in, partition_nodes indicates when the left partition ends
-                        let mut start: usize = 0;
-                        let mut end: usize = 0;
-                    
-                        // We are in the right partition
-                        if index > synchronizer.affected_nodes[i] as usize - 1 {
-                            start = synchronizer.affected_nodes[i] as usize;
-                            end = synchronizer.keys.len();
-                        
-                        } else {
-                            // We are in the left partition
-                            start = 0;
-                            end = synchronizer.affected_nodes[i] as usize;
-                        }
-
-                        // These are the nodes in our side of the partition
-                        for j in start..end {
-                            // No-op here, included for alignment with other modules that track partitions
-                            let _ = synchronizer.keys[j];
-                        }
-
-                        debug!("Synchronizer partition window configured");
-                    } else if effect_type == AsyncEffectType::Failure {
-                        // Check if this worker should simulate failure
-                        let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
-                        
-                        // Only workers for nodes below affected_nodes threshold simulate failure
                         if index < synchronizer.affected_nodes[i] as usize {
                             synchronizer.should_simulate_failure = true;
                             debug!("Synchronizer will simulate failure during async period {}", i);
@@ -181,7 +144,7 @@ impl Synchronizer {
                     }
                 }
             }
-
+            
             synchronizer.run().await;
         });
     }
@@ -209,21 +172,52 @@ impl Synchronizer {
         let timer = sleep(Duration::from_millis(TIMER_RESOLUTION));
         tokio::pin!(timer);
 
+        // Set up async period timers if simulation is enabled
+        if self.simulate_asynchrony {
+            for i in 0..self.asynchrony_start.len() {
+                let start_offset = self.asynchrony_start[i] * 1000; // Convert seconds to milliseconds
+                let end_offset = start_offset + (self.asynchrony_duration[i] * 1000);
+                
+                // Create start and end timers for this async period
+                let async_start = Timer::new(0, 0, start_offset);
+                let async_end = Timer::new(0, 0, end_offset);
+                
+                self.async_timer_futures.push(Box::pin(async_start));
+                self.async_timer_futures.push(Box::pin(async_end));
+            }
+        }
+
         loop {
             tokio::select! {
                 // Handle primary's messages.
                 Some(message) = self.rx_message.recv() => match message {
-                    PrimaryWorkerMessage::Synchronize(digests, target) => {
+                    PrimaryWorkerMessage::Synchronize(digest_worker_pairs, target) => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .expect("Failed to measure time")
                             .as_millis();
-                        debug!("Received sync request for {:?} batches", digests);
+                        debug!("Received sync request for {:?} batches", digest_worker_pairs.len());
                         let mut missing = Vec::new();
-                        for digest in digests {
+                        for (digest, worker_id) in digest_worker_pairs {                        
                             // Ensure we do not send twice the same sync request.
                             if self.pending.contains_key(&digest) {
                                 continue;
+                            }
+
+                            // Check if we have the batch from the specific worker using composite key.
+                            match self.store.read(digest.to_vec()).await {
+                                Ok(None) => {
+                                    missing.push(digest.clone());
+                                    debug!("Requesting sync for batch {} from worker {}", digest, worker_id);
+                                },
+                                Ok(Some(_)) => {
+                                    debug!("already have batch {} from worker {}", digest, worker_id);
+                                    // The batch arrived in the meantime: no need to request it.
+                                },
+                                Err(e) => {
+                                    error!("{}", e);
+                                    continue;
+                                }
                             }
 
                             // Add the digest to the waiter.
@@ -247,14 +241,16 @@ impl Synchronizer {
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
 
                         debug!("Requesting sync for missing {:?}, address is {:?}", missing, address);
-                        
-                        /*let handler = self.network.send(address, Bytes::from(serialized)).await;
-                        self.cancel_handlers
-                            .entry(Digest::default()) 
-                            .or_insert_with(Vec::new)
-                            .push(handler);*/
 
-                        self.network.send(address, Bytes::from(serialized)).await;
+                        // Check if we should drop messages during failure simulation
+                        if self.during_simulated_asynchrony && 
+                           self.current_effect_type == AsyncEffectType::Failure && 
+                           self.should_simulate_failure {
+                            debug!("Synchronizer failure simulation: dropping sync request during failure period");
+                            // Don't send any sync requests - simulate complete failure
+                        } else {
+                            self.network.send(address, Bytes::from(serialized)).await;
+                        }
                         
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
@@ -283,7 +279,7 @@ impl Synchronizer {
                         // We got the batch, remove it from the pending list.
                         debug!("Got from helper batch {}", digest);
                         self.pending.remove(&digest);
-                        //self.cancel_handlers remove(&digest);
+                        //self.cancel_handlers.remove(&digest);
                     },
                     Ok(None) => {
                         // The sync request for this batch has been canceled.
@@ -354,4 +350,3 @@ impl Synchronizer {
         }
     }
 }
-
