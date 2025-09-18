@@ -14,7 +14,7 @@ from benchmark.config import Committee, Key, NodeParameters, BenchParameters, Co
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
-from benchmark.gcp_instance import InstanceManager
+from benchmark.aws_instance import InstanceManager
 
 
 class FabricError(Exception):
@@ -220,6 +220,7 @@ class Bench:
             keys += [Key.from_file(filename)]
 
         names = [x.name for x in keys]
+        ids = [i for i in range(len(keys))]
 
         if bench_parameters.collocate:
             workers = bench_parameters.workers
@@ -230,7 +231,7 @@ class Bench:
             addresses = OrderedDict(
                 (x, y) for x, y in zip(names, hosts)
             )
-        committee = Committee(addresses, self.settings.base_port)
+        committee = Committee(ids, addresses, self.settings.base_port)
         committee.print(PathMaker.committee_file())
 
         node_parameters.print(PathMaker.parameters_file())
@@ -260,26 +261,30 @@ class Bench:
         # for the faulty nodes to be online).
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
+        client_addresses = committee.client_addresses()
         rate_share = ceil(rate / committee.workers())
+        client_id = 0
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
-                client_id = (i * len(addresses)) + id
-                reply_port = self.settings.base_port + 6000 + client_id
-                reply_addr = f'{host}:{reply_port}'
-                cmd = CommandMaker.run_client(
-                    client_id,
-                    reply_addr,
-                    PathMaker.committee_file(),
-                    PathMaker.key_file(i),
-                    PathMaker.db_path(i, id),
-                    bench_parameters.tx_size,
-                    rate_share,
-                    1,
-                    1,
-                )
-                log_file = PathMaker.client_log_file(i, id)
-                self._background_run(host, cmd, log_file)
+                # Get the corresponding client reply address
+                if client_id < len(client_addresses):
+                    reply_addr = client_addresses[client_id]
+                    cmd = CommandMaker.run_client(
+                        client_id,
+                        reply_addr,
+                        PathMaker.committee_file(),
+                        PathMaker.key_file(i),
+                        f'.db-client-{client_id}',
+                        bench_parameters.tx_size,
+                        rate_share,
+                        bench_parameters.worker_fault_tolerance,
+                        threshold=1  # Default threshold
+                    )
+                    print(cmd)
+                    log_file = PathMaker.client_log_file(i, id)
+                    self._background_run(host, cmd, log_file)
+                client_id += 1
 
         # Run the primaries (except the faulty ones).
         Print.info('Booting primaries...')

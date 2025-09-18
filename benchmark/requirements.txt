@@ -1,5 +1,5 @@
 boto3==1.16.0
 fabric==2.6.0
-matplotlib==3.3.4
+matplotlib==3.10.3
 pyopenssl==24.2.1
 google-cloud-compute==1.19.2

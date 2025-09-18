@@ -5,7 +5,7 @@ from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
 from benchmark.plot import Ploter, PlotError
-from benchmark.gcp_instance import InstanceManager
+from benchmark.aws_instance import InstanceManager
 from benchmark.remote import Bench, BenchError
 
 
@@ -16,6 +16,7 @@ def local(ctx, debug=True):
         'faults': 0, 
         'nodes': 4,
         'workers': 1,
+        'worker_fault_tolerance': 2,  # Number of workers each client sends to
         'rate': 10_000,
         'tx_size': 512,
         'duration': 20,
@@ -29,9 +30,9 @@ def local(ctx, debug=True):
     node_params = {
         'timeout_delay': 1_000,  # ms
         'header_size': 32,  # bytes
-        'max_header_delay': 200,  # ms
+        'max_header_delay': 50,  # ms
         'gc_depth': 50,  # rounds
-        'sync_retry_delay': 1_000,  # ms
+        'sync_retry_delay': 100,  # ms
         'sync_retry_nodes': 4,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 1,  # ms
@@ -39,19 +40,20 @@ def local(ctx, debug=True):
         'use_parallel_proposals': True,
         'k': 4,
         'use_fast_path': True,
-        'fast_path_timeout': 200,
+        'fast_path_timeout': 100,
         'use_ride_share': False,
-        'car_timeout': 2000,
+        'car_timeout': 200,
+        'start_slot_rounds': 1,
 
         'simulate_asynchrony': False,
-        'asynchrony_type': [3],
+        'asynchrony_type': [2],
 
         'asynchrony_start': [10_000], #ms
-        'asynchrony_duration': [20_000], #ms
-        'affected_nodes': [2],
+        'asynchrony_duration': [10_000], #ms
+        'affected_nodes': [1],
         'egress_penalty': 50, #ms
 
-        'use_fast_sync': True,
+        'use_fast_sync': False,
         'use_exponential_timeouts': False,
     }
     try:
@@ -122,6 +124,7 @@ def remote(ctx, debug=True):
         'faults': 0,
         'nodes': [4],
         'workers': 1,
+        'worker_fault_tolerance': 2,  # Number of workers each client sends to
         'co-locate': True,
         'rate': [10_000],
         'tx_size': 512,
@@ -143,15 +146,16 @@ def remote(ctx, debug=True):
         'sync_retry_nodes': 4,  # number of nodes
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 200,  # ms
-        'use_optimistic_tips': True,
+        'use_optimistic_tips': False,
         'use_parallel_proposals': True,
-        'k': 4,
+        'k': 1,
         'use_fast_path': True,
         'fast_path_timeout': 200,
         'use_ride_share': False,
         'car_timeout': 2000,
+        'start_slot_rounds': 1,
 
-        'simulate_asynchrony': False,
+        'simulate_asynchrony': True,
         'asynchrony_type': [3],
 
         'asynchrony_start': [10_000], #ms
