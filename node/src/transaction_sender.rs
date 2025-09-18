@@ -280,4 +280,3 @@ mod tests {
         assert_eq!(selected, worker_addresses);
     }
 }
-

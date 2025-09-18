@@ -1,18 +1,18 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_imports)]
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 mod client;
 mod reply_processor;
 mod transaction_sender;
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
-use config::Export as _;
-use config::Import as _;
+use config::{ConfigError, Export as _, Import};
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::SignatureService;
 use env_logger::Env;
-use std::net::SocketAddr;
+use log::error;
 use primary::Header;
 use primary::Primary;
 use store::Store;
@@ -45,8 +45,8 @@ async fn main() -> Result<()> {
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
                     SubCommand::with_name("worker")
-                .about("Run a single worker")
-                .args_from_usage("--id=<INT> 'The worker id'"),
+                        .about("Run a single worker")
+                        .args_from_usage("--id=<INT> 'The worker id'"),
                 )
                 .subcommand(
                     SubCommand::with_name("client")
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                         .args_from_usage("--size=[INT] 'The size of each transaction in bytes (default: 512)'")
                         .args_from_usage("--rate=[INT] 'The rate (txs/s) at which to send transactions (default: 1000)'")
                         .args_from_usage("--workers=[INT] 'The number of workers to send to (default: 1)'")
-                        .args_from_usage("--threshold=[INT] 'Number of confirmations required (default: 1)'")
+                        .args_from_usage("--threshold=[INT] 'Number of confirmations required (default: 1)'"),
                 )
                 .setting(AppSettings::SubcommandRequiredElseHelp),
         )
@@ -181,33 +181,34 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .context("The worker id must be a positive integer")?;
             Worker::spawn(keypair.name, id, committee, parameters, store);
         }
+
+        // Spawn a client.
         ("client", Some(sub_matches)) => {
-            // Client arguments (keys and store are accepted but not required by the client logic)
             let client_id = sub_matches
                 .value_of("client-id")
                 .unwrap()
                 .parse::<u8>()
-                .context("The client ID must be between 0 and 255")?;
-
+                .context("The client id must be between 0 and 255")?;
+            
             let reply_addr = sub_matches
                 .value_of("reply-addr")
                 .unwrap()
-                .parse::<SocketAddr>()
+                .parse()
                 .context("Invalid reply address format")?;
 
-            let size = sub_matches
+            let transaction_size = sub_matches
                 .value_of("size")
                 .unwrap_or("512")
                 .parse::<usize>()
                 .context("Transaction size must be a positive integer")?;
 
-            let rate = sub_matches
+            let transaction_rate = sub_matches
                 .value_of("rate")
                 .unwrap_or("1000")
                 .parse::<u64>()
                 .context("Transaction rate must be a positive integer")?;
 
-            let workers = sub_matches
+            let worker_count = sub_matches
                 .value_of("workers")
                 .unwrap_or("1")
                 .parse::<usize>()
@@ -219,20 +220,16 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .parse::<usize>()
                 .context("Threshold must be a positive integer")?;
 
-            let params = client::ClientParameters {
-                transaction_size: size,
-                transaction_rate: rate,
-                worker_count: workers,
+            let client_parameters = client::ClientParameters {
+                transaction_size,
+                transaction_rate,
+                worker_count,
                 threshold,
             };
 
-            client::Client::spawn(client_id, committee, params, reply_addr);
-
-            // Keep the client alive
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
+            client::Client::spawn(client_id, committee, client_parameters, reply_addr);
         }
+        
         _ => unreachable!(),
     }
 

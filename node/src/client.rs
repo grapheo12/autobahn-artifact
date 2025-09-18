@@ -193,4 +193,3 @@ mod tests {
         Client::spawn(0, committee, parameters, reply_address);
     }
 }
-

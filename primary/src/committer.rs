@@ -144,7 +144,6 @@ impl Committer {
                     let executed_slot = state.last_executed_slot + 1;
                     let current = state.log.get(&executed_slot).unwrap().clone();
                     debug!("Currently executing slot {:?}", executed_slot);
-                    let mut last_header: Option<Header> = None;
 
                     if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = current {
                         for (pk, proposal) in proposals {
@@ -180,18 +179,21 @@ impl Committer {
                                         info!("Committed {} -> {:?}", header, digest);
                                     }
                                 }
-                                last_header = Some(header.clone());
+                                
                                 // Output the block to the top-level application.
                                 if let Err(e) = self.tx_output.send(header.clone()).await {
                                     debug!("Failed to send block through the output channel: {}", e);
                                 }
+
+                                // Send SlotCommittedMessage to workers for this header's batches
+                                let executed_slot = state.last_executed_slot + 1;
+                                if let Err(e) = self.send_slot_committed_message(executed_slot, &header).await {
+                                    debug!("Failed to send slot committed message for header {}: {}", header.digest(), e);
+                                }
+                                
+                                debug!("Finish upcall");
                             }
                         }
-                    }
-
-                    // Inform workers (best-effort) of the committed slot
-                    if let Some(h) = last_header.as_ref() {
-                        let _ = self.send_slot_committed_message(executed_slot, h).await;
                     }
 
                     state.last_executed_slot += 1;
@@ -225,33 +227,33 @@ impl Committer {
         }
     }
 
-    /// Send SlotCommittedMessage to workers when a slot is committed with their batches
-    async fn send_slot_committed_message(&mut self, slot: Slot, header: &Header) -> Result<(), Box<dyn std::error::Error>> {
-        // Collect all batch digests from the header
-        let all_batch_digests: Vec<Digest> = header.payload.keys().cloned().collect();
-        
-        if all_batch_digests.is_empty() {
-            return Ok(());
-        }
-        
-        // Send SlotCommittedMessage to our first worker (worker 0) with all batches
-        if let Ok(worker_info) = self.committee.worker(&self.name, &0) {
-            let batch_count = all_batch_digests.len();
-            let message = PrimaryWorkerMessage::SlotCommitted(slot, all_batch_digests);
-            let bytes = bincode::serialize(&message)
-                .map_err(|e| format!("Failed to serialize slot committed message: {}", e))?;
-
-            let address = worker_info.primary_to_worker;
-            let handler = self.network.send(address, Bytes::from(bytes)).await;
-            self.cancel_handlers.push(handler);
-            debug!("Sent SlotCommittedMessage for slot {} to worker 0 with {} batches", 
-                   slot, batch_count);
-        } else {
-            debug!("Worker 0 not found in committee for primary {}", self.name);
-        }
-        
-        Ok(())
+   /// Send SlotCommittedMessage to workers when a slot is committed with their batches
+   async fn send_slot_committed_message(&mut self, slot: Slot, header: &Header) -> Result<(), Box<dyn std::error::Error>> {
+    // Collect all batch digests from the header
+    let all_batch_digests: Vec<Digest> = header.payload.keys().cloned().collect();
+    
+    if all_batch_digests.is_empty() {
+        return Ok(());
     }
+    
+    // Send SlotCommittedMessage to our first worker (worker 0) with all batches
+    if let Ok(worker_info) = self.committee.worker(&self.name, &0) {
+        let batch_count = all_batch_digests.len();
+        let message = PrimaryWorkerMessage::SlotCommitted(slot, all_batch_digests);
+        let bytes = bincode::serialize(&message)
+            .map_err(|e| format!("Failed to serialize slot committed message: {}", e))?;
+
+        let address = worker_info.primary_to_worker;
+        let handler = self.network.send(address, Bytes::from(bytes)).await;
+        self.cancel_handlers.push(handler);
+        debug!("Sent SlotCommittedMessage for slot {} to worker 0 with {} batches", 
+               slot, batch_count);
+    } else {
+        debug!("Worker 0 not found in committee for primary {}", self.name);
+    }
+    
+    Ok(())
+}
 
     /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):
     /// https://en.wikipedia.org/wiki/Tree_traversal#Pre-order

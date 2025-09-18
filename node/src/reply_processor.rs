@@ -235,4 +235,3 @@ mod tests {
         assert_eq!(stats.transactions_with_confirmations, 2);
     }
 }
-
