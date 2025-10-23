@@ -17,9 +17,9 @@ def local(ctx, debug=True):
         'nodes': 4,
         'workers': 1,
         'worker_fault_tolerance': 2,  # Number of workers each client sends to
-        'rate': 4_000,
+        'rate': 10_000,
         'tx_size': 512,
-        'duration': 20,
+        'duration': 60,
 
         # Unused
         'simulate_partition': True,
@@ -28,9 +28,9 @@ def local(ctx, debug=True):
         'partition_nodes': 1,
     }
     node_params = {
-        'timeout_delay': 2_000,  # ms
+        'timeout_delay': 1_000,  # ms
         'header_size': 32,  # bytes
-        'max_header_delay': 50,  # ms
+        'max_header_delay': 5,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 100,  # ms
         'sync_retry_nodes': 4,  # number of nodes
@@ -46,12 +46,12 @@ def local(ctx, debug=True):
         'start_slot_rounds': 1,
 
         'simulate_asynchrony': True,
-        'asynchrony_type': [2],
+        'asynchrony_type': [4],
 
-        'asynchrony_start': [10_000], #ms
-        'asynchrony_duration': [2_000], #ms
-        'affected_nodes': [1],
-        'egress_penalty': 50, #ms
+        'asynchrony_start': [0], #ms
+        'asynchrony_duration': [70_000], #ms
+        'affected_nodes': [4],
+        'egress_penalty': 25, #ms
 
         'use_fast_sync': False,
         'use_exponential_timeouts': False,
