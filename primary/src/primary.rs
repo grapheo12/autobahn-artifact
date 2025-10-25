@@ -64,7 +64,7 @@ pub enum PrimaryWorkerMessage {
     /// The primary indicates a round update.
     Cleanup(Height),
     /// The primary indicates that a slot has been committed with batch digests.
-    SlotCommitted(Slot, Vec<Digest>),
+    SlotCommitted(Slot, HashSet<Digest>),
 }
 
 /// The messages sent by the workers to their primary.

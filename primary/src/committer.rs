@@ -145,6 +145,8 @@ impl Committer {
                     let current = state.log.get(&executed_slot).unwrap().clone();
                     debug!("Currently executing slot {:?}", executed_slot);
 
+                    let mut payloads = HashSet::new();
+
                     if let ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } = current {
                         for (pk, proposal) in proposals {
                             let stop_height = *state.last_executed_heights.get(&pk).unwrap();
@@ -185,15 +187,19 @@ impl Committer {
                                     debug!("Failed to send block through the output channel: {}", e);
                                 }
 
-                                // Send SlotCommittedMessage to workers for this header's batches
-                                let executed_slot = state.last_executed_slot + 1;
-                                if let Err(e) = self.send_slot_committed_message(executed_slot, &header).await {
-                                    debug!("Failed to send slot committed message for header {}: {}", header.digest(), e);
-                                }
+                                payloads.extend(header.payload.keys().cloned());
+
+                                
                                 
                                 debug!("Finish upcall");
                             }
                         }
+                    }
+
+                    // Send SlotCommittedMessage to workers for this header's batches
+                    let executed_slot = state.last_executed_slot + 1;
+                    if let Err(e) = self.send_slot_committed_message(executed_slot, payloads).await {
+                        debug!("Failed to send slot committed message for slot {}: {}", executed_slot, e);
                     }
 
                     state.last_executed_slot += 1;
@@ -228,18 +234,17 @@ impl Committer {
     }
 
    /// Send SlotCommittedMessage to workers when a slot is committed with their batches
-   async fn send_slot_committed_message(&mut self, slot: Slot, header: &Header) -> Result<(), Box<dyn std::error::Error>> {
+   async fn send_slot_committed_message(&mut self, slot: Slot, payloads: HashSet<Digest>) -> Result<(), Box<dyn std::error::Error>> {
     // Collect all batch digests from the header
-    let all_batch_digests: Vec<Digest> = header.payload.keys().cloned().collect();
     
-    if all_batch_digests.is_empty() {
+    if payloads.is_empty() {
         return Ok(());
     }
     
     // Send SlotCommittedMessage to our first worker (worker 0) with all batches
     if let Ok(worker_info) = self.committee.worker(&self.name, &0) {
-        let batch_count = all_batch_digests.len();
-        let message = PrimaryWorkerMessage::SlotCommitted(slot, all_batch_digests);
+        let batch_count = payloads.len();
+        let message = PrimaryWorkerMessage::SlotCommitted(slot, payloads);
         let bytes = bincode::serialize(&message)
             .map_err(|e| format!("Failed to serialize slot committed message: {}", e))?;
 

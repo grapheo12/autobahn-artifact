@@ -5,7 +5,7 @@ use config::Committee;
 use crypto::Digest;
 use futures::sink::SinkExt;
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use store::Store;
 use tokio::net::TcpStream;
@@ -17,9 +17,11 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 /// use to send transactions to workers.
 pub struct ReplySender {
     /// Receiver for slot committed messages containing (slot, batch_digests).
-    rx_slot_committed: Receiver<(u64, Vec<Digest>)>,
+    rx_slot_committed: Receiver<(u64, HashSet<Digest>)>,
     /// The persistent storage for reading batches.
     store: Store,
+    // Client transaction set
+    client_transactions: HashSet<Vec<u8>>,
     /// Committee configuration for looking up client addresses.
     /// This follows the same pattern as workers looking up addresses from committee.
     committee: Committee,
@@ -27,7 +29,7 @@ pub struct ReplySender {
 
 impl ReplySender {
     pub fn spawn(
-        rx_slot_committed: Receiver<(u64, Vec<Digest>)>,
+        rx_slot_committed: Receiver<(u64, HashSet<Digest>)>,
         store: Store,
         committee: Committee,
     ) {
@@ -36,6 +38,7 @@ impl ReplySender {
                 rx_slot_committed,
                 store,
                 committee,
+                client_transactions: HashSet::new(),
             }
             .run()
             .await;
@@ -64,14 +67,20 @@ impl ReplySender {
                                 // Extract transaction IDs from each transaction in the batch
                                 for transaction in batch {
                                     if transaction.len() >= 10 {
+                                        if self.client_transactions.contains(&transaction) {
+                                            continue;
+                                        }
+                                        
                                         let client_id = transaction[1];
                                         let counter = u64::from_be_bytes(
                                             transaction[2..10].try_into().unwrap()
                                         );
+                                        
                                         client_transactions
                                             .entry(client_id)
                                             .or_insert_with(Vec::new)
                                             .push(counter);
+                                        self.client_transactions.insert(transaction);
                                     }
                                 }
                             }
