@@ -355,7 +355,7 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
-    tx_reply_sender: Sender<(u64, Vec<Digest>)>,   //sender channel to connect to reply sender.
+    tx_reply_sender: Sender<(u64, HashSet<Digest>)>,   //sender channel to connect to reply sender.
 }
 
 #[async_trait]
