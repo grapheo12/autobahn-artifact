@@ -284,7 +284,8 @@ class LogParser:
                 f.write(str(line[0]) + ',' + str(line[1]) + ',' + str((line[2])) + '\n')
         
         # Calculate mean and percentiles
-        mean_latency = mean(sample_latency) if sample_latency else 0
+        #mean_latency = mean(sample_latency) if sample_latency else 0
+        mean_latency = mean(all_latency) if all_latency else 0
 
         if all_latency:
             sorted_latency = sorted(all_latency)
