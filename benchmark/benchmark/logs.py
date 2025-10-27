@@ -34,9 +34,21 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples, self.client_commits, self.all_sent_transactions \
-            = zip(*results)
+        (
+            self.size,
+            self.rate,
+            self.start,
+            misses,
+            self.sent_samples,
+            self.client_commits,
+            self.all_sent_transactions,
+        ) = zip(*results)
         self.misses = sum(misses)
+
+        # Collate client-side observations to keep earliest timestamps per transaction.
+        self.sample_sends = self._aggregate_transactions(self.sent_samples)
+        self.transaction_sends = self._aggregate_transactions(self.all_sent_transactions)
+        self.committed_transactions = self._aggregate_transactions(self.client_commits)
 
         # Parse the primaries logs.
         try:
@@ -54,10 +66,8 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, self.all_received_transactions, workers_ips = zip(*results)
-        self.sizes = {
-            k: v for x in sizes for k, v in x.items() if k in self.commits
-        }
+        sizes, workers_ips = zip(*results)
+        self.sizes = {k: v for x in sizes for k, v in x.items() if k in self.commits}
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -77,6 +87,14 @@ class LogParser:
                     merged[k] = v
         return merged
 
+    def _aggregate_transactions(self, dicts):
+        aggregated = {}
+        for d in dicts:
+            for k, v in d.items():
+                if k not in aggregated or v < aggregated[k]:
+                    aggregated[k] = v
+        return aggregated
+
     def _parse_clients(self, log):
         if search(r'Error', log) is not None:
             raise ParseError('Client(s) panicked')
@@ -90,11 +108,17 @@ class LogParser:
         misses = len(findall(r'rate too high', log))
 
         tmp = findall(r'\[(.*Z) .* sending sample transaction (\d+) from client (\d+)', log)
-        samples = {(int(s), int(c)): self._to_posix(t) for t, s, c in tmp}
+        samples = {}
+        for t, s, c in tmp:
+            key = (int(s), int(c))
+            samples.setdefault(key, self._to_posix(t))
 
         # Parse regular transaction sends
         tmp = findall(r'\[(.*Z) .* sending regular transaction (\d+) from client (\d+)', log)
-        regular_sends = {(int(s), int(c)): self._to_posix(t) for t, s, c in tmp}
+        regular_sends = {}
+        for t, s, c in tmp:
+            key = (int(s), int(c))
+            regular_sends.setdefault(key, self._to_posix(t))
 
         # Combine sample and regular transaction send times
         all_sends = {}
@@ -103,7 +127,10 @@ class LogParser:
 
         # Parse transaction commits - extract both client_id and transaction counter
         tmp = findall(r'\[(.*Z) .* Client (\d+) transaction (\d+) committed', log)
-        commits = {(int(tx_counter), int(client_id)): self._to_posix(t) for t, client_id, tx_counter in tmp}
+        commits = {}
+        for t, client_id, tx_counter in tmp:
+            key = (int(tx_counter), int(client_id))
+            commits.setdefault(key, self._to_posix(t))
 
         return size, rate, start, misses, samples, commits, all_sends
 
@@ -158,16 +185,9 @@ class LogParser:
         sizes = {d: int(s) for d, s in tmp}
 
         # Extract sample transactions for latency measurement
-        tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+) from client (\d+)', log)
-        samples = {(int(s), int(c)): d for d, s, c in tmp}
-
-        # Extract all transactions (both sample and non-sample) for throughput calculation
-        tmp_all = findall(r'Batch ([^ ]+) contains (?:sample )?tx (\d+) from client (\d+)', log)
-        all_transactions = {(int(s), int(c)): d for d, s, c in tmp_all}
-
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
-        return sizes, samples, all_transactions, ip
+        return sizes, ip
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
@@ -179,14 +199,13 @@ class LogParser:
         start, end = min(self.proposals.values()), max(self.commits.values())
         duration = end - start
         
-        # Count unique transactions across all workers
-        unique_transactions = set()
-        for received in self.all_received_transactions:
-            for tx_id, batch_id in received.items():
-                if batch_id in self.commits:
-                    unique_transactions.add(tx_id)
+        committed_keys = [
+            key for key in self.committed_transactions.keys() if key in self.transaction_sends
+        ]
+        if not committed_keys or duration <= 0:
+            return 0, 0, duration
 
-        unique_tx_count = len(unique_transactions)
+        unique_tx_count = len(committed_keys)
         bytes = unique_tx_count * self.size[0]
         bps = bytes / duration
         tps = bps / self.size[0]
@@ -197,19 +216,22 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def _end_to_end_throughput(self):
-        if not self.commits:
+        if not self.commits or not self.committed_transactions:
             return 0, 0, 0
-        start, end = min(self.start), max(self.commits.values())
-        duration = end - start
-        
-        # Count unique transactions across all workers
-        unique_transactions = set()
-        for received in self.all_received_transactions:
-            for tx_id, batch_id in received.items():
-                if batch_id in self.commits:
-                    unique_transactions.add(tx_id)
 
-        unique_tx_count = len(unique_transactions)
+        committed_keys = [
+            key for key in self.committed_transactions.keys() if key in self.transaction_sends
+        ]
+        if not committed_keys:
+            return 0, 0, 0
+
+        start = min(self.transaction_sends[key] for key in committed_keys)
+        end = max(self.committed_transactions[key] for key in committed_keys)
+        duration = end - start
+        if duration <= 0:
+            return 0, 0, 0
+
+        unique_tx_count = len(committed_keys)
         print('Num unique transactions committed: ', unique_tx_count)
         bytes = unique_tx_count * self.size[0]
         bps = bytes / duration
@@ -221,31 +243,19 @@ class LogParser:
         all_latency = []
         list_latencies = []
         first_start = 0
-        set_first = True
         
-        # Create a combined sent samples dict from all clients (for mean calculation)
-        all_sent_samples = {}
-        for sent in self.sent_samples:
-            all_sent_samples.update(sent)
-        
-        # Create a combined all transactions dict from all clients (for percentiles)
-        all_sent_transactions = {}
-        for sent in self.all_sent_transactions:
-            all_sent_transactions.update(sent)
-        
-        # Create a combined client commits dict from all clients
-        all_client_commits = {}
-        for commits in self.client_commits:
-            all_client_commits.update(commits)
+        # Create combined dicts from aggregated data
+        all_sent_samples = self.sample_sends
+        all_sent_transactions = self.transaction_sends
+        all_client_commits = self.committed_transactions
 
         print('Num sent samples: ', len(all_sent_samples))
         print('Num sent transactions: ', len(all_sent_transactions))
         print('Num client commits: ', len(all_client_commits))
 
         # Calculate latency for sample transactions (for mean)
-        for tx_id in all_sent_samples:
-            if tx_id in all_client_commits:  # tx_id is (counter, client_id)
-                send_time = all_sent_samples[tx_id]
+        for tx_id, send_time in all_sent_samples.items():
+            if tx_id in all_client_commits:
                 commit_time = all_client_commits[tx_id]
                 tx_latency = commit_time - send_time
 
@@ -258,9 +268,8 @@ class LogParser:
                 print('tx_id not in all_client_commits: ', tx_id)
 
         # Calculate latency for all transactions (for percentiles)
-        for tx_id in all_sent_transactions:
-            if tx_id in all_client_commits:  # tx_id is (counter, client_id)
-                send_time = all_sent_transactions[tx_id]
+        for tx_id, send_time in all_sent_transactions.items():
+            if tx_id in all_client_commits:
                 commit_time = all_client_commits[tx_id]
                 tx_latency = commit_time - send_time
 

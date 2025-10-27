@@ -247,7 +247,7 @@ impl BatchMaker {
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    info!("BatchMaker: max batch delay timer triggered");
+                    //info!("BatchMaker: max batch delay timer triggered");
                     if !self.current_batch.is_empty() {
                         self.seal(&mut batch_count).await;
                     }
@@ -348,25 +348,18 @@ impl BatchMaker {
                     .unwrap(),
             );
 
-            for (tx_type, client_id, counter) in all_tx_ids {
-                if tx_type == 0u8 {
-                    // Sample transaction
-                    // NOTE: This log entry is used to compute performance.
-                    info!(
-                        "Batch {:?} contains sample tx {} from client {}",
-                        digest,
-                        counter,
-                        client_id
-                    );
-                } else {
-                    // Non-sample transaction
-                    info!(
-                        "Batch {:?} contains tx {} from client {}",
-                        digest,
-                        counter,
-                        client_id
-                    );
-                }
+            let sample_count = all_tx_ids
+                .iter()
+                .filter(|(tx_type, _, _)| *tx_type == 0u8)
+                .count();
+            let regular_count = all_tx_ids.len() - sample_count;
+            if log::log_enabled!(log::Level::Debug) && !all_tx_ids.is_empty() {
+                debug!(
+                    "Batch {:?} aggregates {} sample tx(s) and {} regular tx(s)",
+                    digest,
+                    sample_count,
+                    regular_count
+                );
             }
 
             // NOTE: This log entry is used to compute performance.
@@ -448,4 +441,3 @@ impl BatchMaker {
             .expect("Failed to deliver batch");*/
     }
 }
-
