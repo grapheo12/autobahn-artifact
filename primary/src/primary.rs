@@ -65,6 +65,8 @@ pub enum PrimaryWorkerMessage {
     Cleanup(Height),
     /// The primary indicates that a slot has been committed with batch digests.
     SlotCommitted(Slot, HashSet<Digest>),
+    /// The primary indicates that a certificate has been formed with batch digests.
+    CertificateFormed(HashSet<Digest>),
 }
 
 /// The messages sent by the workers to their primary.

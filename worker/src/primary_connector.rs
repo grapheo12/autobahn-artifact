@@ -1,11 +1,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::worker::SerializedBatchDigestMessage;
 use bytes::Bytes;
-use log::debug;
+use log::{debug, info, warn};
+use network::CancelHandler;
 use network::{ReliableSender, SimpleSender};
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Receiver;
-use network::CancelHandler;
 
 // Send batches' digests to the primary.
 pub struct PrimaryConnector {

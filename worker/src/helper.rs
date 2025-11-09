@@ -5,12 +5,12 @@ use crypto::{Digest, PublicKey};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error, warn};
-use network::{ReliableSender, SimpleSender};
 use network::CancelHandler;
+use network::{ReliableSender, SimpleSender};
 use primary::timer::Timer;
-use store::Store;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
+use store::Store;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{sleep, Duration};
 
@@ -78,7 +78,7 @@ impl Helper {
         tokio::spawn(async move {
             let mut keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
             keys.sort();
-            
+
             let mut helper = Self {
                 name,
                 id,
@@ -99,7 +99,7 @@ impl Helper {
                 should_simulate_failure: false,
                 async_timer_futures: FuturesUnordered::new(),
             };
-            
+
             // Determine if this worker should simulate failure
             if helper.simulate_asynchrony {
                 for i in 0..helper.asynchrony_start.len() {
@@ -113,7 +113,7 @@ impl Helper {
                     }
                 }
             }
-            
+
             helper.run().await;
         });
     }
@@ -124,23 +124,23 @@ impl Helper {
             for i in 0..self.asynchrony_start.len() {
                 let start_offset = self.asynchrony_start[i] * 1000; // Convert seconds to milliseconds
                 let end_offset = start_offset + (self.asynchrony_duration[i] * 1000);
-                
+
                 // Create start and end timers for this async period
                 let async_start = Timer::new(0, 0, start_offset);
                 let async_end = Timer::new(0, 0, end_offset);
-                
+
                 self.async_timer_futures.push(Box::pin(async_start));
                 self.async_timer_futures.push(Box::pin(async_end));
             }
         }
-        
+
         loop {
             tokio::select! {
                 // Handle batch requests
                 Some((digests, origin)) = self.rx_request.recv() => {
                     // TODO [issue #7]: Do some accounting to prevent bad nodes from monopolizing our resources.
                     debug!("Received helper batch request {:?}", digests);
-                    
+
                     // Get the requestor's address
                     let address = match self.committee.worker(&origin, &self.id) {
                         Ok(x) => x.worker_to_worker,
@@ -149,16 +149,16 @@ impl Helper {
                             continue;
                         }
                     };
-                    
+
                     // Check if we should drop messages during failure simulation
-                    if self.during_simulated_asynchrony && 
-                       self.current_effect_type == AsyncEffectType::Failure && 
+                    if self.during_simulated_asynchrony &&
+                       self.current_effect_type == AsyncEffectType::Failure &&
                        self.should_simulate_failure {
                         debug!("Helper failure simulation: dropping batch response during failure period");
                         // Don't send any responses - simulate complete failure
                         continue;
                     }
-                    
+
                     // Reply to the request (the best we can)
                     for digest in digests {
                         match self.store.read(digest.to_vec()).await {
@@ -173,12 +173,12 @@ impl Helper {
                         }
                     }
                 },
-                
+
                 // Handle async period timer events
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     // Toggle the async period state
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
-                    
+
                     if self.during_simulated_asynchrony {
                         // Starting a new async period - pop the next effect type
                         if !self.asynchrony_type.is_empty() {

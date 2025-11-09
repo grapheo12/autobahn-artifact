@@ -16,19 +16,17 @@ use log::{debug, error, warn};
 use log::info;
 use network::{ReliableSender, SimpleSender};
 use primary::{Primary, PrimaryWorkerMessage, WorkerPrimaryMessage};
-use std::collections::{HashSet, VecDeque, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
 //#[cfg(feature = "benchmark")]
 
+use primary::timer::Timer;
+use std::convert::TryInto as _;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration};
-use store::Store;
-use std::convert::TryInto as _;
-use primary::timer::Timer;
-
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -47,10 +45,10 @@ pub type Slot = u64;
 #[derive(Clone, PartialEq, std::fmt::Debug)]
 pub enum AsyncEffectType {
     Off = 0,
-    TempBlip = 1, //Send nothing for x seconds, and then release all messages
-    Failure = 2, //Send nothing for x seconds  //TODO: Combine with TempBlip?
+    TempBlip = 1,  //Send nothing for x seconds, and then release all messages
+    Failure = 2,   //Send nothing for x seconds  //TODO: Combine with TempBlip?
     Partition = 3, //Send nothing to partitioned replicas for x seconds, then release all
-    Egress = 4,  //For x seconds, delay all outbound messages by some amount
+    Egress = 4,    //For x seconds, delay all outbound messages by some amount
 }
 fn uint_to_enum(v: u8) -> AsyncEffectType {
     unsafe { std::mem::transmute(v) }
@@ -64,9 +62,9 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-   
+
     //tx_message: Sender<QuorumWaiterMessage>,  /// Output channel to deliver sealed batches to the `QuorumWaiter`.
-    tx_batch: Sender<Vec<u8>>,   // channel to forward batch digest to processor in order for primary to propose.
+    tx_batch: Sender<Vec<u8>>, // channel to forward batch digest to processor in order for primary to propose.
 
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
@@ -91,18 +89,16 @@ pub struct BatchMaker {
     store: Store,
     // Quorum waiter
     tx_message: Sender<QuorumWaiterMessage>,
-    /// Shared map from batch digest to list of transaction IDs (client_id, counter) for reply tracking
-    batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>,
     //Simulating an async event
-    pub simulate_asynchrony: bool, 
+    pub simulate_asynchrony: bool,
     //Type of effects: 0 for delay full async duration, 1 for partition, 2 for  failure, 3 for egress delay. Will start #type many blips.
-    pub asynchrony_type: VecDeque<u8>, 
+    pub asynchrony_type: VecDeque<u8>,
     //Start of async period   //offset from current time (in seconds) when to start next async effect
-    pub asynchrony_start: VecDeque<u64>,     
+    pub asynchrony_start: VecDeque<u64>,
     //Duration of async period
-    pub asynchrony_duration: VecDeque<u64>,  
+    pub asynchrony_duration: VecDeque<u64>,
     ////first k nodes experience specified async behavior
-    pub affected_nodes: VecDeque<u64>, 
+    pub affected_nodes: VecDeque<u64>,
     ////public keys of the other works
     pub keys: Vec<PublicKey>,
     //name of the worker
@@ -115,14 +111,12 @@ impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
         max_batch_delay: u64,
-        rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler 
+        rx_transaction: Receiver<Transaction>, //receiver channel from worker.TxReceiverHandler
         tx_message: Sender<QuorumWaiterMessage>, //sender channel to worker.QuorumWaiter
-        tx_batch: Sender<Vec<u8>>,   // sender channel to worker.Processor
+        tx_batch: Sender<Vec<u8>>,             // sender channel to worker.Processor
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
         //partition_public_keys: HashSet<PublicKey>,
         mut store: Store,
-        batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>, // shared mapping for reply tracking
-        
         simulate_asynchrony: bool,
         asynchrony_type: VecDeque<u8>,
         asynchrony_start: VecDeque<u64>,
@@ -137,7 +131,7 @@ impl BatchMaker {
                 max_batch_delay,
                 rx_transaction,
                 tx_message, //previously forwarded batch to Quorum_waiter; now skipping this step.
-                tx_batch,  
+                tx_batch,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
@@ -150,7 +144,6 @@ impl BatchMaker {
                 partition_public_keys: HashSet::new(),
                 partition_queue: VecDeque::new(),
                 store,
-                batch_to_transactions,
                 simulate_asynchrony,
                 asynchrony_type,
                 asynchrony_start,
@@ -171,20 +164,20 @@ impl BatchMaker {
         let mut batch_count = 0u64;
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
-        
+
         if self.simulate_asynchrony {
             for i in 0..self.asynchrony_start.len() {
                 let start_offset = self.asynchrony_start[i];
-                let end_offset = start_offset +  self.asynchrony_duration[i];
-                            
+                let end_offset = start_offset + self.asynchrony_duration[i];
+
                 let async_start = Timer::new(0, 0, start_offset);
                 let async_end = Timer::new(0, 0, end_offset);
 
                 self.async_timer_futures.push(Box::pin(async_start));
                 self.async_timer_futures.push(Box::pin(async_end));
-                
+
                 let effect_type = uint_to_enum(self.asynchrony_type[i]);
-                
+
                 if effect_type == AsyncEffectType::Partition {
                     self.keys.sort();
                     let index = self.keys.binary_search(&self.name).unwrap();
@@ -192,12 +185,11 @@ impl BatchMaker {
                     // Figure out which partition we are in, partition_nodes indicates when the left partition ends
                     let mut start: usize = 0;
                     let mut end: usize = 0;
-                
+
                     // We are in the right partition
                     if index > self.affected_nodes[i] as usize - 1 {
                         start = self.affected_nodes[i] as usize;
                         end = self.keys.len();
-                    
                     } else {
                         // We are in the left partition
                         start = 0;
@@ -214,7 +206,7 @@ impl BatchMaker {
                     // Check if this worker should simulate failure
                     self.keys.sort();
                     let index = self.keys.binary_search(&self.name).unwrap();
-                    
+
                     // Only workers for nodes below affected_nodes threshold simulate failure
                     if index < self.affected_nodes[i] as usize {
                         self.should_simulate_failure = true;
@@ -223,8 +215,7 @@ impl BatchMaker {
                 }
             }
         }
-        
-        
+
         /*let timer1 = sleep(Duration::from_secs(10));
         tokio::pin!(timer1);
         let timer2 = sleep(Duration::from_secs(30));
@@ -235,7 +226,7 @@ impl BatchMaker {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
                     transaction_count += 1;
-                    
+
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -257,7 +248,7 @@ impl BatchMaker {
 
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
-                    
+
                     if self.during_simulated_asynchrony {
                         // Starting async period - determine effect type
                         if !self.asynchrony_type.is_empty() {
@@ -320,19 +311,6 @@ impl BatchMaker {
             })
             .collect();
 
-        // Extract transaction IDs for reply mapping (regardless of benchmark feature)
-        let transaction_ids: Vec<(u8, u64)> = self
-            .current_batch
-            .iter()
-            .filter(|tx| tx.len() > 9 && (tx[0] == 0u8 || tx[0] == 1u8))
-            .filter_map(|tx| {
-                let client_id = tx[1];
-                let counter_bytes: [u8; 8] = tx[2..10].try_into().ok()?;
-                let counter = u64::from_be_bytes(counter_bytes);
-                Some((client_id, counter))
-            })
-            .collect();
-
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
@@ -353,12 +331,10 @@ impl BatchMaker {
                 .filter(|(tx_type, _, _)| *tx_type == 0u8)
                 .count();
             let regular_count = all_tx_ids.len() - sample_count;
-            if log::log_enabled!(log::Level::Debug) && !all_tx_ids.is_empty() {
+            if log::log_enabled!(log::Level::Debug) && (!all_tx_ids.is_empty()) {
                 debug!(
                     "Batch {:?} aggregates {} sample tx(s) and {} regular tx(s)",
-                    digest,
-                    sample_count,
-                    regular_count
+                    digest, sample_count, regular_count
                 );
             }
 
@@ -370,16 +346,17 @@ impl BatchMaker {
 
         //NEW:
         //Best-effort broadcast only. Any failure is correlated with the primary operating this node (running on same machine)
-        
-        let bytes = Bytes::from(serialized.clone());
-        let digest = Digest(Sha512::digest(&serialized).as_slice()[..32].try_into().unwrap());
 
-        // Store the batch-to-transaction mapping for reply tracking
-        self.batch_to_transactions.lock().unwrap().insert(digest.clone(), transaction_ids);
+        let bytes = Bytes::from(serialized.clone());
+        let digest = Digest(
+            Sha512::digest(&serialized).as_slice()[..32]
+                .try_into()
+                .unwrap(),
+        );
 
         // Store the batch.
         self.store.write(digest.to_vec(), serialized.clone()).await;
-        
+
         // Send batch to processor
         if let Err(e) = self.tx_batch.send(serialized.clone()).await {
             error!("BatchMaker: Failed to send batch to processor: {}", e);
@@ -394,31 +371,39 @@ impl BatchMaker {
                         // Don't broadcast anything - simulate complete failure
                     } else {
                         // This worker is not affected by failure, send normally
-                        let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+                        let (_, addresses): (Vec<_>, _) =
+                            self.workers_addresses.iter().cloned().unzip();
                         self.network.broadcast(addresses, bytes).await;
                     }
-                },
+                }
                 AsyncEffectType::Partition => {
                     debug!("BatchMaker: Simulated partition enabled. Only sending to partitioned keys from broadcast");
-                    let new_addresses: Vec<_> = self.workers_addresses.iter().filter(|(pk, _)| self.partition_public_keys.contains(pk)).map(|(_, addr)| addr).cloned().collect();
-                    //let (_, addresses) = new_addresses iter().cloned().unzip();
+                    let new_addresses: Vec<_> = self
+                        .workers_addresses
+                        .iter()
+                        .filter(|(pk, _)| self.partition_public_keys.contains(pk))
+                        .map(|(_, addr)| addr)
+                        .cloned()
+                        .collect();
+                    //let (_, addresses) = new_addresses.iter().cloned().unzip();
                     //debug!("addresses is {:?}", new_addresses);
                     self.partition_queue.push_back(message);
                     debug!("partition queue size is {:?}", self.partition_queue.len());
-                    self.network.broadcast(new_addresses, bytes).await; 
-                },
+                    self.network.broadcast(new_addresses, bytes).await;
+                }
                 _ => {
                     // For other async types, send normally (could be extended for other effects)
-                    let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+                    let (_, addresses): (Vec<_>, _) =
+                        self.workers_addresses.iter().cloned().unzip();
                     self.network.broadcast(addresses, bytes).await;
                 }
             }
         } else {
             //debug!("sending batch normally");
             let (_, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-            self.network.broadcast(addresses, bytes).await; 
+            self.network.broadcast(addresses, bytes).await;
         }
-        
+
         /*let digest = Digest(Sha512::digest(&serialized).as_slice()[..32].try_into().unwrap());
         self.store.write(digest.to_vec(), serialized.clone()).await;
         self.tx_batch.send(serialized.clone()).await.expect("Failed to deliver batch");
@@ -429,7 +414,7 @@ impl BatchMaker {
         let new_addresses: Vec<_> = self.workers_addresses.iter().filter(|(pk, _)| self.partition_public_keys.contains(pk)).map(|(_, addr)| addr).cloned().collect();
         let bytes = Bytes::from(serialized.clone());
         //let handlers = self.network.broadcast(addresses, bytes).await;
-        let handlers = self.network.broadcast(new_addresses, bytes).await;  
+        let handlers = self.network.broadcast(new_addresses, bytes).await;
 
         // // Send the batch through the deliver channel for further processing.
         self.tx_message

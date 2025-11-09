@@ -12,19 +12,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
+use ed25519_dalek::Digest as _;
+use ed25519_dalek::Sha512;
 use futures::sink::SinkExt as _;
 use log::{debug, error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, HashMap};
-use std::sync::{Arc, Mutex};
-use std::error::Error;
-use store::Store;
-use tokio::sync::mpsc::{channel, Sender, Receiver as OtherReceiver};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
+use std::error::Error;
+use std::sync::{Arc, Mutex};
+use store::Store;
+use tokio::sync::mpsc::{channel, Receiver as OtherReceiver, Sender};
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -51,8 +51,13 @@ pub enum WorkerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotTransactionReply {
     pub slot: u64,
+    pub worker_key: PublicKey,
     pub committed_transactions: Vec<u64>,
 }
+
+/// Shared cache mapping batch digests to (client_id, counter) tuples.
+pub type BatchTransactionMap =
+    Arc<Mutex<HashMap<Digest, Arc<Vec<(u8, u64)>>>>>;
 
 pub struct Worker {
     /// The public key of this authority.
@@ -86,13 +91,14 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        
+
         // Shared mapping from batch digest to transaction IDs for reply tracking
-        let batch_to_transactions = Arc::new(Mutex::new(HashMap::<Digest, Vec<(u8, u64)>>::new()));
-        
-        worker.handle_primary_messages(batch_to_transactions.clone());                         //spawns async task that listens for network message from Primary
-        worker.handle_clients_transactions(tx_primary.clone(), batch_to_transactions);   //spawns async task that listens for network messages from Client
-        worker.handle_workers_messages(tx_primary);               //spawns async task that listens for network messages from other Workers
+        let batch_to_transactions: BatchTransactionMap =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        worker.handle_primary_messages(batch_to_transactions.clone()); //spawns async task that listens for network message from Primary
+        worker.handle_clients_transactions(tx_primary.clone(), batch_to_transactions.clone()); //spawns async task that listens for network messages from Client
+        worker.handle_workers_messages(tx_primary, batch_to_transactions); //spawns async task that listens for network messages from other Workers
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -100,8 +106,8 @@ impl Worker {
                 .committee
                 .primary(&worker.name)
                 .expect("Our public key is not in the committee")
-                .worker_to_primary,                              //filter primary associated with current worker based on the committee config.
-            rx_primary,                                          //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
+                .worker_to_primary, //filter primary associated with current worker based on the committee config.
+            rx_primary, //receiver channel to connect to primary channel (i.e. how other listener functions can invoke to PrimaryConnector)
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -117,13 +123,13 @@ impl Worker {
         );
     }
 
-///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
-
+    ///////////////////////// TASK INSTANTIATORS ///////////////////////////////////
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self, batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>) {
+    fn handle_primary_messages(&self, batch_to_transactions: BatchTransactionMap) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and Synchronizer
-        let (tx_reply_sender, rx_reply_sender) = channel(CHANNEL_CAPACITY); //channel for slot committed -> reply sender
+        let (tx_reply_sender, rx_reply_sender) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and ReplySender
+        let (tx_certificate_ack_sender, rx_certificate_ack_sender) = channel(CHANNEL_CAPACITY); //channel between PrimaryReceiverHandler and CertificateAckSender
 
         // Receive incoming messages from our primary.
         let mut address = self
@@ -133,16 +139,17 @@ impl Worker {
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
-            address,                                    //socket to receive Primary messages from
+            address, //socket to receive Primary messages from
             /* handler */
-            PrimaryReceiverHandler { 
+            PrimaryReceiverHandler {
                 tx_synchronizer,
                 tx_reply_sender,
-            }, //handler for received Primary messages, routes to synchronizer or reply sender
+                tx_certificate_ack_sender,
+            }, //handler for received Primary messages, routes to synchronizer, reply sender, or certificate ack sender
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
-        // it receives from our primary, and commands `Helper` and `QuorumWaiter` to do the same.
+        // it receives from the primary (which are mainly notifications that we are out of sync).
         Synchronizer::spawn(
             self.name,
             self.id,
@@ -160,7 +167,25 @@ impl Worker {
         );
 
         // Spawn ReplySender component to handle SlotCommittedMessage
-        ReplySender::spawn(rx_reply_sender, self.store.clone(), self.committee.clone());
+        ReplySender::spawn(
+            rx_reply_sender,
+            batch_to_transactions.clone(),
+            self.committee.clone(),
+            self.id,
+            self.name,
+        );
+
+        // Spawn CertificateAckSender component to handle CertificateFormed messages
+        use crate::certificate_ack_sender::CertificateAckSender;
+        let total_clients = self.committee.clients.len();
+        CertificateAckSender::spawn(
+            self.name,
+            self.id,
+            total_clients,
+            rx_certificate_ack_sender,
+            batch_to_transactions.clone(),
+            self.committee.clone(),
+        );
 
         info!(
             "Worker {} listening to primary messages on {}",
@@ -169,10 +194,15 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>, batch_to_transactions: Arc<Mutex<HashMap<Digest, Vec<(u8, u64)>>>>)  {  //tx_primary: channel between processor and PrimaryConnector
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);      //channel between TxReceive (Client) and batch maker
-        let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);  //channel between batch maker and quorum waiter
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);          //channel between quorum waiter and processor
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        batch_to_transactions: BatchTransactionMap,
+    ) {
+        //tx_primary: channel between processor and PrimaryConnector
+        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY); //channel between TxReceive (Client) and batch maker
+        let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY); //channel between batch maker and quorum waiter
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between quorum waiter and processor
 
         // We first receive clients' transactions from the network.
         let mut address = self
@@ -182,9 +212,37 @@ impl Worker {
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
-            address,                                            //socket to receive Client messages from
-            /* handler */ TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
+            address, //socket to receive Client messages from
+            /* handler */
+            TxReceiverHandler { tx_batch_maker }, //handler for received Client messages, forwards them to batch maker
         );
+
+        /*let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+        let mut partition_public_keys = HashSet::new();
+        keys.sort();
+        let index = keys.binary_search(&self.name).unwrap();
+
+        // Figure out which partition we are in, partition_nodes indicates when the left partition ends
+        let mut start: usize = 0;
+        let mut end: usize = 0;
+
+        // We are in the right partition
+        if index > 2 as usize - 1 {
+            start = 2 as usize;
+            end = keys.len();
+
+        } else {
+            // We are in the left partition
+            start = 0;
+            end = 2 as usize;
+        }
+
+        // These are the nodes in our side of the partition
+        for j in start..end {
+            partition_public_keys.insert(keys[j]);
+        }
+
+        debug!("partition pks are {:?}", partition_public_keys);*/
 
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
@@ -192,9 +250,11 @@ impl Worker {
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
-            /* rx_transaction */ rx_batch_maker,  //receiver channel to connect to TxReceiverHandler 
-            /*tx_message*/ tx_quorum_waiter,   //sender channel to connect to quorum waiter
-           /* tx_batch */ tx_processor,  //sender channel to connect to processor
+            /* rx_transaction */
+            rx_batch_maker, //receiver channel to connect to TxReceiverHandler
+            /*tx_message*/
+            tx_quorum_waiter, //sender channel to connect to quorum waiter
+            /* tx_batch */ tx_processor, //sender channel to connect to processor
             /* workers_addresses */
             self.committee
                 .others_workers(&self.name, &self.id)
@@ -203,7 +263,6 @@ impl Worker {
                 .collect(),
             //partition_public_keys,
             self.store.clone(),
-            batch_to_transactions.clone(), // shared mapping for reply tracking
             self.parameters.simulate_asynchrony.clone(),
             self.parameters.asynchrony_type.clone(),
             self.parameters.asynchrony_start.clone(),
@@ -216,10 +275,11 @@ impl Worker {
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
         // // the batch to the `Processor`.
         QuorumWaiter::spawn(
-             self.committee.clone(),
-             /* stake */ self.committee.stake(&self.name),
-             /* rx_message */ rx_quorum_waiter, //receiver channel to connect to batch maker.
-             /* tx_batch */ //tx_processor,  //sender channel to connect to processor
+            self.committee.clone(),
+            /* stake */ self.committee.stake(&self.name),
+            /* rx_message */
+            rx_quorum_waiter, //receiver channel to connect to batch maker.
+                              /* tx_batch */ //tx_processor,  //sender channel to connect to processor
         );
 
         // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
@@ -227,8 +287,9 @@ impl Worker {
         Processor::spawn(
             self.id,
             self.store.clone(),
-            /* rx_batch */ rx_processor,  //receiver channel to connect to quorum waiter
-            /* tx_digest */ tx_primary,   //sender channel to connect to PrimaryConnector
+            /* rx_batch */ rx_processor, //receiver channel to connect to quorum waiter
+            /* tx_digest */ tx_primary, //sender channel to connect to PrimaryConnector
+            batch_to_transactions.clone(),
             /* own_batch */ true,
         );
 
@@ -239,9 +300,13 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from other workers.
-    fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
-        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);         //channel between WorkReceiverHandler and Helper
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);   //channel between WorkReceiverHandler and Processor
+    fn handle_workers_messages(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        batch_to_transactions: BatchTransactionMap,
+    ) {
+        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Helper
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY); //channel between WorkReceiverHandler and Processor
 
         // Receive incoming messages from other workers.
         let mut address = self
@@ -251,11 +316,12 @@ impl Worker {
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
         Receiver::spawn(
-            address,                     //socket to receive Worker messages from
+            address, //socket to receive Worker messages from
             /* handler */
-            WorkerReceiverHandler {      //handler for received Worker messages, forwards them either to helper, or processor -- depending on (?)
-                tx_helper,               //sender channel to connect to helper
-                tx_processor,            //sender channel to connect to processor
+            WorkerReceiverHandler {
+                //handler for received Worker messages, forwards them either to helper, or processor -- depending on (?)
+                tx_helper,    //sender channel to connect to helper
+                tx_processor, //sender channel to connect to processor
             },
         );
 
@@ -265,7 +331,8 @@ impl Worker {
             self.id,
             self.committee.clone(),
             self.store.clone(),
-            /* rx_request */ rx_helper,   //receiver channel to connect to WorkerReceiverHandler
+            /* rx_request */
+            rx_helper, //receiver channel to connect to WorkerReceiverHandler
             self.parameters.simulate_asynchrony,
             self.parameters.asynchrony_type.clone(),
             self.parameters.asynchrony_start.clone(),
@@ -278,8 +345,10 @@ impl Worker {
         Processor::spawn(
             self.id,
             self.store.clone(),
-            /* rx_batch */ rx_processor,   //receiver channel to connect to WorkerReceiverHandler
-            /* tx_digest */ tx_primary,    //sender channel to connect to PrimaryConnector
+            /* rx_batch */
+            rx_processor, //receiver channel to connect to WorkerReceiverHandler
+            /* tx_digest */ tx_primary, //sender channel to connect to PrimaryConnector
+            batch_to_transactions,
             /* own_batch */ false,
         );
 
@@ -292,21 +361,22 @@ impl Worker {
 
 /////////////////////////// Network Handlers ///////////////////////////////
 
-
 /// Defines how the network receiver handles incoming transactions.
 //Note: Only expect to receive client messages submitting new transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,  //sender channel to connect to batch maker
+    tx_batch_maker: Sender<Transaction>, //sender channel to connect to batch maker
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         // Send the transaction to the batch maker
-        self.tx_batch_maker.send(message.to_vec()).await
+        self.tx_batch_maker
+            .send(message.to_vec())
+            .await
             .map_err(|e| format!("Failed to send transaction to BatchMaker: {}", e))?;
-        
+
         Ok(())
     }
 }
@@ -315,8 +385,8 @@ impl MessageHandler for TxReceiverHandler {
 //Note: Only expect to receive worker messages that are a) proposing batches, or b) acknowledging batches
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_helper: Sender<(Vec<Digest>, PublicKey)>,   //sender channel to connect to helper
-    tx_processor: Sender<SerializedBatchMessage>,  //sender channel to connect to processor
+    tx_helper: Sender<(Vec<Digest>, PublicKey)>, //sender channel to connect to helper
+    tx_processor: Sender<SerializedBatchMessage>, //sender channel to connect to processor
 }
 
 #[async_trait]
@@ -324,38 +394,45 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         //NEW: Do not need to Reply with an ack... Currently simple sender expects it though so we keep it (useful for debugging). Simple sender just sinks the reply.
         // // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;     //Question: Where is ack signed? Is authenticated channel assumed? TLS?
-        // //Acknowledge Batches received. 
-        // //Note: Missing Batch Requests don't expect an ack (they use simple sender) -- seems like it is sent anyways, but origin probably simply ignores it.
+        let _ = writer.send(Bytes::from("Ack")).await; //Question: Where is ack signed? Is authenticated channel assumed? TLS?
+                                                       // //Acknowledge Batches received.
+                                                       // //Note: Missing Batch Requests don't expect an ack (they use simple sender) -- seems like it is sent anyways, but origin probably simply ignores it.
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(_, _)) => {
-                let digest = Digest(Sha512::digest(&serialized.to_vec()).as_slice()[..32].try_into().unwrap());
+                let digest = Digest(
+                    Sha512::digest(&serialized.to_vec()).as_slice()[..32]
+                        .try_into()
+                        .unwrap(),
+                );
                 debug!("Received batch message {:?}", digest);
-                self     //If receive batch message from another worker. Store the batch, and process.
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch")
-            },
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self  //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
-                .tx_helper
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send batch request"),
+                self //If receive batch message from another worker. Store the batch, and process.
+                    .tx_processor
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send batch")
+            }
+            Ok(WorkerMessage::BatchRequest(missing, requestor)) => {
+                self //If receive message from another worker that is missing a batch. Reply if we have batch ourselves.
+                    .tx_helper
+                    .send((missing, requestor))
+                    .await
+                    .expect("Failed to send batch request")
+            }
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())
     }
 }
 
-/// Defines how the network receiver handles incoming primary messages.  
-//Note: Handles primary messages for synchronization and slot commitment notifications.
+/// Defines how the network receiver handles incoming primary messages.
+//Note: Handles primary messages for synchronization, slot commitment notifications, and certificate formation notifications.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_synchronizer: Sender<PrimaryWorkerMessage>,  //sender channel to connect to synchronizer.
-    tx_reply_sender: Sender<(u64, HashSet<Digest>)>,   //sender channel to connect to reply sender.
+    tx_synchronizer: Sender<PrimaryWorkerMessage>, //sender channel to connect to synchronizer.
+    tx_reply_sender: Sender<(u64, HashSet<Digest>)>, //sender channel to connect to reply sender.
+    tx_certificate_ack_sender: Sender<HashSet<Digest>>, //sender channel to connect to certificate ack sender.
 }
 
 #[async_trait]
@@ -377,7 +454,15 @@ impl MessageHandler for PrimaryReceiverHandler {
                             .send((*slot, batch_digests.clone()))
                             .await
                             .expect("Failed to send slot committed message to reply sender");
-                    },
+                    }
+                    primary::PrimaryWorkerMessage::CertificateFormed(batch_digests) => {
+                        // Route CertificateFormed to certificate ack sender
+                        debug!("Worker received CertificateFormed with {} batch digests, routing to CertificateAckSender", batch_digests.len());
+                        self.tx_certificate_ack_sender
+                            .send(batch_digests.clone())
+                            .await
+                            .expect("Failed to send certificate formed message to certificate ack sender");
+                    }
                     _ => {
                         // Route other messages to synchronizer
                         self.tx_synchronizer
@@ -386,7 +471,7 @@ impl MessageHandler for PrimaryReceiverHandler {
                             .expect("Failed to send message to synchronizer");
                     }
                 }
-            },
+            }
         }
         Ok(())
     }
