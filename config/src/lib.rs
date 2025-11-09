@@ -1,5 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, PublicKey, SecretKey, Hash};
+use crypto::{
+    generate_keypair, generate_production_keypair, Hash, PublicKey, SecretKey,
+};
 use log::info;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,12 @@ pub enum ConfigError {
 
     #[error("Failed to write config file '{file}': {message}")]
     ExportError { file: String, message: String },
+
+    #[error("Failed to read config file '{file}': {message}")]
+    ReadError { file: String, message: String },
+
+    #[error("Failed to write config file '{file}': {message}")]
+    WriteError { file: String, message: String },
 }
 
 pub trait Import: DeserializeOwned {
@@ -38,7 +46,7 @@ pub trait Import: DeserializeOwned {
     }
 }
 
-pub trait Export: Serialize {
+pub trait Export: Serialize + DeserializeOwned {
     fn export(&self, path: &str) -> Result<(), ConfigError> {
         let writer = || -> Result<(), std::io::Error> {
             let file = OpenOptions::new().create(true).write(true).open(path)?;
@@ -53,11 +61,44 @@ pub trait Export: Serialize {
             message: e.to_string(),
         })
     }
+
+    fn read(path: &str) -> Result<Self, ConfigError> {
+        let reader = || -> Result<Self, std::io::Error> {
+            let data = fs::read(path)?;
+            Ok(serde_json::from_slice(data.as_slice())?)
+        };
+        reader().map_err(|e| ConfigError::ReadError {
+            file: path.to_string(),
+            message: e.to_string(),
+        })
+    }
+
+    fn write(&self, path: &str) -> Result<(), ConfigError> {
+        let writer = || -> Result<(), std::io::Error> {
+            let file = OpenOptions::new().create(true).write(true).open(path)?;
+            let mut writer = BufWriter::new(file);
+            let data = serde_json::to_string_pretty(self).unwrap();
+            writer.write_all(data.as_ref())?;
+            writer.write_all(b"\n")?;
+            Ok(())
+        };
+        writer().map_err(|e| ConfigError::WriteError {
+            file: path.to_string(),
+            message: e.to_string(),
+        })
+    }
 }
 
 pub type Stake = u32;
 pub type WorkerId = u32;
 pub type ClientId = u8;
+
+fn default_start_slot_rounds() -> u64 {
+    1
+}
+fn default_use_threshold_random_coin() -> bool {
+    true
+}
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
@@ -84,12 +125,16 @@ pub struct Parameters {
     pub max_batch_delay: u64,
 
     //Autobahn protocol config parameters
-    pub use_optimistic_tips: bool,     //default = true (TODO: implement non optimistic tip option)
-    
-    pub use_parallel_proposals: bool,  //default = true (TODO: implement sequential slot option)
-    pub k: u64, //Max open conensus instances at a time.
+    pub use_optimistic_tips: bool, //default = true (TODO: implement non optimistic tip option)
+    #[serde(default = "default_use_threshold_random_coin")]
+    pub use_threshold_random_coin: bool,
+    #[serde(default)]
+    pub optimistic_leader_only: bool,
 
-    pub use_fast_path: bool,           //default = false
+    pub use_parallel_proposals: bool, //default = true (TODO: implement sequential slot option)
+    pub k: u64,                       //Max open conensus instances at a time.
+
+    pub use_fast_path: bool, //default = false
     pub fast_path_timeout: u64,
 
     pub use_ride_share: bool,
@@ -99,16 +144,20 @@ pub struct Parameters {
     // pub simulate_asynchrony: bool,
     // pub asynchrony_start: u64,
     // pub asynchrony_duration: u64,
-
-    pub simulate_asynchrony: bool, //Simulating an async event
+    pub simulate_asynchrony: bool,          //Simulating an async event
     pub asynchrony_type: VecDeque<u8>, //Type of effects: 0 for delay full async duration, 1 for partition, 2 for  failure, 3 for egress delay. Will start #type many blips.
-    pub asynchrony_start: VecDeque<u64>,     //Start of async period   //offset from current time (in seconds) when to start next async effect
-    pub asynchrony_duration: VecDeque<u64>,  //Duration of async period
-    pub affected_nodes: VecDeque<u64>, ////first k nodes experience specified async behavior
+    pub asynchrony_start: VecDeque<u64>, //Start of async period   //offset from current time (in seconds) when to start next async effect
+    pub asynchrony_duration: VecDeque<u64>, //Duration of async period
+    pub affected_nodes: VecDeque<u64>,   ////first k nodes experience specified async behavior
 
     pub egress_penalty: u64, //ms of delay
     pub use_fast_sync: bool,
     pub use_exponential_timeouts: bool,
+
+    // Number of start-slot rounds non-optimistic leaders must complete
+    // before proposing in a slot. 1 preserves previous behavior.
+    #[serde(default = "default_start_slot_rounds")]
+    pub start_slot_rounds: u64,
 }
 
 impl Default for Parameters {
@@ -125,6 +174,8 @@ impl Default for Parameters {
 
             //Autobahn microbench configs
             use_optimistic_tips: true,
+            use_threshold_random_coin: true,
+            optimistic_leader_only: false,
             use_parallel_proposals: true,
             k: 4,
             use_fast_path: true,
@@ -137,16 +188,17 @@ impl Default for Parameters {
             // asynchrony_start: 20_000, //20 second in
             // asynchrony_duration: 10_000, //10 seconds
 
-             //Async simulation:
+            //Async simulation:
             simulate_asynchrony: false,
-            asynchrony_type: vec![0].into(), 
+            asynchrony_type: vec![0].into(),
             asynchrony_start: vec![20_000].into(), //20 second in
             asynchrony_duration: vec![10_000].into(), //10 seconds
             affected_nodes: vec![0].into(),
-            
+
             egress_penalty: 0,
             use_fast_sync: false,
             use_exponential_timeouts: false,
+            start_slot_rounds: 1,
         }
     }
 }
@@ -165,10 +217,28 @@ impl Parameters {
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
 
-        info!("Fast path enabled? {}. Fast timeout: {}", self.use_fast_path, self.fast_path_timeout);
+        info!(
+            "Fast path enabled? {}. Fast timeout: {}",
+            self.use_fast_path, self.fast_path_timeout
+        );
         info!("Optimistic tips enabled? {}", self.use_optimistic_tips);
-        info!("Parallel Proposals enabled? {}. K: {}", self.use_parallel_proposals, self.k);
-        info!("Ride share enabled? {}. Car timeout: {}", self.use_ride_share, self.car_timeout);
+        info!(
+            "Threshold random coin enabled? {}",
+            self.use_threshold_random_coin
+        );
+        info!(
+            "Optimistic-leader-only mode enabled? {}",
+            self.optimistic_leader_only
+        );
+        info!(
+            "Parallel Proposals enabled? {}. K: {}",
+            self.use_parallel_proposals, self.k
+        );
+        info!(
+            "Ride share enabled? {}. Car timeout: {}",
+            self.use_ride_share, self.car_timeout
+        );
+        info!("Start-slot rounds set to {}", self.start_slot_rounds);
     }
 }
 
@@ -187,12 +257,6 @@ pub struct PrimaryAddresses {
 }
 
 #[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
-pub struct ClientAddresses {
-    /// Address to receive transaction replies from workers (WAN).
-    pub replies: SocketAddr,
-}
-
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
 pub struct WorkerAddresses {
     /// Address to receive client transactions (WAN).
     pub transactions: SocketAddr,
@@ -202,44 +266,54 @@ pub struct WorkerAddresses {
     pub primary_to_worker: SocketAddr,
 }
 
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
+pub struct ClientAddresses {
+    /// Address to receive transaction replies from workers (WAN).
+    pub replies: SocketAddr,
+    /// Address to receive early ACKs from workers when certificates form.
+    pub transaction_acks: SocketAddr,
+}
+
 #[derive(Clone, Deserialize)]
 pub struct Authority {
     /// The voting power of this authority.
     pub stake: Stake,
-    #[serde(default)]
-    /// An optional deterministic id for client mapping.
-    pub id: usize,
     /// The network addresses of the consensus protocol.
     pub consensus: ConsensusAddresses,
     /// The network addresses of the primary.
     pub primary: PrimaryAddresses,
     /// Map of workers' id and their network addresses.
     pub workers: HashMap<WorkerId, WorkerAddresses>,
+    // Id for tss
+    pub id: usize, // id of the node in the tss public key share set
 }
 
 #[derive(Clone, Deserialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
-    #[serde(default)]
     /// Map of clients' id and their network addresses.
     pub clients: HashMap<ClientId, ClientAddresses>,
-    //pub id_map: HashMap<PublicKey, u64>, //position 
+    //pub id_map: HashMap<PublicKey, u64>, //position
 }
 
 impl Import for Committee {}
 
 impl Committee {
-    pub fn new(info: Vec<(PublicKey, Stake, SocketAddr)>) -> Self {
+    pub fn new(info: Vec<(PublicKey, usize, Stake, SocketAddr)>) -> Self {
         Self {
             authorities: info
                 .into_iter()
-                .enumerate()
-                .map(|(idx, (name, stake, address))| {
+                .map(|(name, id, stake, address)| {
                     let authority = Authority {
                         stake,
-                        id: idx,
-                        consensus: ConsensusAddresses { consensus_to_consensus: address },
-                        primary: PrimaryAddresses { primary_to_primary: address, worker_to_primary: address },
+                        id,
+                        consensus: ConsensusAddresses {
+                            consensus_to_consensus: address,
+                        },
+                        primary: PrimaryAddresses {
+                            primary_to_primary: address,
+                            worker_to_primary: address,
+                        },
                         workers: HashMap::new(),
                     };
                     (name, authority)
@@ -266,6 +340,16 @@ impl Committee {
             .filter(|(name, _)| name != &myself)
             .map(|(name, authority)| (*name, authority.stake))
             .collect()
+    }
+
+    pub fn random_coin_threshold(&self) -> Stake {
+        /*let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
+        (total_votes - 1) / 3 + 1*/
+        self.quorum_threshold()
+    }
+
+    pub fn id(&self, name: PublicKey) -> usize {
+        self.authorities.get(&name).unwrap().id
     }
 
     /// Returns the stake required to reach a quorum (2f+1).
@@ -372,7 +456,9 @@ impl Committee {
     }
 
     pub fn address(&self, name: &PublicKey) -> Option<SocketAddr> {
-        self.authorities.get(name).map(|x| x.consensus.consensus_to_consensus)
+        self.authorities
+            .get(name)
+            .map(|x| x.consensus.consensus_to_consensus)
     }
 
     pub fn broadcast_addresses(&self, myself: &PublicKey) -> Vec<(PublicKey, SocketAddr)> {

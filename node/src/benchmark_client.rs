@@ -1,15 +1,21 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 mod client;
+mod metrics;
 mod reply_processor;
 mod transaction_sender;
 
-use client::{Client, ClientParameters};
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings};
+use client::{Client, ClientParameters};
 use config::{Committee, Import};
 use env_logger::Env;
 use log::info;
+use metrics::MetricsCollector;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use tokio::time::Duration;
+
+const CLIENT_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,11 +24,15 @@ async fn main() -> Result<()> {
         .about("Benchmark client for Sailfish - now supports replies!")
         .args_from_usage("--client-id=<INT> 'Unique identifier for this client (0-255)'")
         .args_from_usage("--reply-addr=<ADDR> 'The address for receiving replies'")
+        .args_from_usage("--ack-addr=<ADDR> 'The address for receiving early ACKs'")
         .args_from_usage("--committee=<FILE> 'The file containing committee information'")
         .args_from_usage("--size=[INT] 'The size of each transaction in bytes (default: 512)'")
         .args_from_usage("--rate=[INT] 'The rate (txs/s) at which to send transactions (default: 1000)'")
         .args_from_usage("--workers=[INT] 'The number of workers to send to (default: 1)'")
         .args_from_usage("--threshold=[INT] 'Number of confirmations required (default: 1)'")
+        .args_from_usage("--duration=[INT] 'How long to send transactions before shutting down (seconds, default: 20)'")
+        .args_from_usage("--transaction-timeout=[INT] 'Timeout in ms for early ACKs before retry (default: 150)'")
+        .args_from_usage("--metrics-file=[FILE] 'Path where the client writes latency metrics'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
 
@@ -42,9 +52,15 @@ async fn main() -> Result<()> {
         .parse::<SocketAddr>()
         .context("Invalid reply address format")?;
 
+    let ack_addr = matches
+        .value_of("ack-addr")
+        .unwrap()
+        .parse::<SocketAddr>()
+        .context("Invalid ACK address format")?;
+
     let committee_file = matches.value_of("committee").unwrap();
-    let committee = Committee::import(committee_file)
-        .context("Failed to load committee information")?;
+    let committee =
+        Committee::import(committee_file).context("Failed to load committee information")?;
 
     let transaction_size = matches
         .value_of("size")
@@ -70,26 +86,114 @@ async fn main() -> Result<()> {
         .parse::<usize>()
         .context("Threshold must be a positive integer")?;
 
+    let duration_secs = matches
+        .value_of("duration")
+        .unwrap_or("20")
+        .parse::<u64>()
+        .context("Duration must be a non-negative integer")?;
+    let run_duration = Duration::from_secs(duration_secs);
+
+    let transaction_timeout = matches
+        .value_of("transaction-timeout")
+        .unwrap_or("150")
+        .parse::<u64>()
+        .context("Transaction timeout must be a positive integer")?;
+
+    let default_metrics_path = format!("logs/client-{}-metrics", client_id);
+    let metrics_path = matches
+        .value_of("metrics-file")
+        .map(|p| p.to_owned())
+        .unwrap_or(default_metrics_path);
+    let metrics_path = PathBuf::from(metrics_path);
+
     // NOTE: These log entries are used to compute performance.
     info!("Client {} starting", client_id);
     info!("Reply address: {}", reply_addr);
+    info!("ACK address: {}", ack_addr);
     info!("Transactions size: {} B", transaction_size);
     info!("Transactions rate: {} tx/s", transaction_rate);
     info!("Worker count: {}", worker_count);
     info!("Confirmation threshold: {}", threshold);
+    info!("Run duration: {} s", duration_secs);
+    info!("Transaction timeout: {} ms", transaction_timeout);
 
     let client_parameters = ClientParameters {
         transaction_size,
         transaction_rate,
         worker_count,
         threshold,
+        duration: run_duration,
+        transaction_timeout,
     };
 
     // Spawn the client process
-    Client::spawn(client_id, committee, client_parameters, reply_addr);
+    let metrics_handle = Client::spawn(
+        client_id,
+        committee,
+        client_parameters,
+        reply_addr,
+        ack_addr,
+        metrics_path,
+    );
 
-    // Keep the main process alive
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    wait_for_shutdown(metrics_handle, run_duration).await?;
+    Ok(())
+}
+
+async fn wait_for_shutdown(metrics: MetricsCollector, run_duration: Duration) -> Result<()> {
+    enum ShutdownReason {
+        DurationElapsed,
+        Signal,
     }
+
+    let reason = if run_duration.is_zero() {
+        wait_for_shutdown_signal().await?;
+        ShutdownReason::Signal
+    } else {
+        tokio::select! {
+            _ = tokio::time::sleep(run_duration) => ShutdownReason::DurationElapsed,
+            res = wait_for_shutdown_signal() => {
+                res?;
+                ShutdownReason::Signal
+            }
+        }
+    };
+
+    if matches!(reason, ShutdownReason::DurationElapsed) {
+        info!(
+            "Client runtime limit of {:?} reached; allowing {:?} for replies to drain",
+            run_duration, CLIENT_DRAIN_GRACE
+        );
+        tokio::time::sleep(CLIENT_DRAIN_GRACE).await;
+    }
+
+    metrics.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            res?;
+        }
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+        _ = sighup.recv() => {}
+    };
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }

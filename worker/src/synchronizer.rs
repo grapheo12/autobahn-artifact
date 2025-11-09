@@ -6,18 +6,18 @@ use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
-use primary::Height;
-use network::ReliableSender;
 use network::CancelHandler;
+use network::ReliableSender;
 use network::SimpleSender;
+use primary::timer::Timer;
+use primary::Height;
 use primary::PrimaryWorkerMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-use primary::timer::Timer;
-use std::pin::Pin;
 
 #[cfg(test)]
 #[path = "tests/synchronizer_tests.rs"]
@@ -69,7 +69,7 @@ pub struct Synchronizer {
     pending: HashMap<Digest, (Round, Sender<()>, u128)>,
 
     cancel_handlers: HashMap<Digest, Vec<CancelHandler>>,
-    
+
     // Failure simulation fields
     simulate_asynchrony: bool,
     asynchrony_type: VecDeque<u8>,
@@ -104,7 +104,7 @@ impl Synchronizer {
         tokio::spawn(async move {
             let mut keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
             keys.sort();
-            
+
             let mut synchronizer = Self {
                 name,
                 id,
@@ -130,7 +130,7 @@ impl Synchronizer {
                 should_simulate_failure: false,
                 async_timer_futures: FuturesUnordered::new(),
             };
-            
+
             // Determine if this worker should simulate failure
             if synchronizer.simulate_asynchrony {
                 for i in 0..synchronizer.asynchrony_start.len() {
@@ -139,12 +139,15 @@ impl Synchronizer {
                         let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
                         if index < synchronizer.affected_nodes[i] as usize {
                             synchronizer.should_simulate_failure = true;
-                            debug!("Synchronizer will simulate failure during async period {}", i);
+                            debug!(
+                                "Synchronizer will simulate failure during async period {}",
+                                i
+                            );
                         }
                     }
                 }
             }
-            
+
             synchronizer.run().await;
         });
     }
@@ -177,11 +180,11 @@ impl Synchronizer {
             for i in 0..self.asynchrony_start.len() {
                 let start_offset = self.asynchrony_start[i] * 1000; // Convert seconds to milliseconds
                 let end_offset = start_offset + (self.asynchrony_duration[i] * 1000);
-                
+
                 // Create start and end timers for this async period
                 let async_start = Timer::new(0, 0, start_offset);
                 let async_end = Timer::new(0, 0, end_offset);
-                
+
                 self.async_timer_futures.push(Box::pin(async_start));
                 self.async_timer_futures.push(Box::pin(async_end));
             }
@@ -198,13 +201,14 @@ impl Synchronizer {
                             .as_millis();
                         debug!("Received sync request for {:?} batches", digest_worker_pairs.len());
                         let mut missing = Vec::new();
-                        for (digest, worker_id) in digest_worker_pairs {                        
+                        for (digest, worker_id) in digest_worker_pairs {
                             // Ensure we do not send twice the same sync request.
                             if self.pending.contains_key(&digest) {
                                 continue;
                             }
 
                             // Check if we have the batch from the specific worker using composite key.
+                            //let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
                             match self.store.read(digest.to_vec()).await {
                                 Ok(None) => {
                                     missing.push(digest.clone());
@@ -243,15 +247,15 @@ impl Synchronizer {
                         debug!("Requesting sync for missing {:?}, address is {:?}", missing, address);
 
                         // Check if we should drop messages during failure simulation
-                        if self.during_simulated_asynchrony && 
-                           self.current_effect_type == AsyncEffectType::Failure && 
+                        if self.during_simulated_asynchrony &&
+                           self.current_effect_type == AsyncEffectType::Failure &&
                            self.should_simulate_failure {
                             debug!("Synchronizer failure simulation: dropping sync request during failure period");
                             // Don't send any sync requests - simulate complete failure
                         } else {
                             self.network.send(address, Bytes::from(serialized)).await;
                         }
-                        
+
                     },
                     PrimaryWorkerMessage::Cleanup(round) => {
                         // Keep track of the primary's round number.
@@ -263,7 +267,7 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _) in self.pending values() {
+                        for (r, handler, _) in self.pending.values() {
                             if r <= &gc_round {
                                 let _ = handler.send(()).await;
                             }
@@ -306,8 +310,8 @@ impl Synchronizer {
                     }
                     if !retry.is_empty() {
                         // Check if we should drop messages during failure simulation
-                        if self.during_simulated_asynchrony && 
-                           self.current_effect_type == AsyncEffectType::Failure && 
+                        if self.during_simulated_asynchrony &&
+                           self.current_effect_type == AsyncEffectType::Failure &&
                            self.should_simulate_failure {
                             debug!("Synchronizer failure simulation: dropping retry sync requests during failure period");
                             // Don't send any retry sync requests - simulate complete failure
@@ -328,12 +332,12 @@ impl Synchronizer {
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
                 },
-                
+
                 // Handle async period timer events
                 Some((slot, view)) = self.async_timer_futures.next() => {
                     // Toggle the async period state
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
-                    
+
                     if self.during_simulated_asynchrony {
                         // Starting a new async period - pop the next effect type
                         if !self.asynchrony_type.is_empty() {

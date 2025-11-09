@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 mod batch_maker;
+mod certificate_ack_sender;
 mod helper;
 mod primary_connector;
 mod processor;

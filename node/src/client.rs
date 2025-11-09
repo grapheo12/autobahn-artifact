@@ -1,28 +1,36 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::metrics::MetricsCollector;
 use crate::reply_processor::ReplyProcessor;
 use crate::transaction_sender::TransactionSender;
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{ClientId, Committee, Parameters};
+use config::{ClientId, Committee};
 use crypto::PublicKey;
-use futures::sink::SinkExt as _;
-use log::{debug, error, info, warn};
+use log::{info, warn};
 use network::{MessageHandler, Receiver, Writer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::{channel, Receiver as OtherReceiver, Sender};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::mpsc::{channel, Sender};
 
-/// The default channel capacity for each channel of the client.
-pub const CHANNEL_CAPACITY: usize = 1_000;
+/// Reply channel capacity sized for >200k tx/s workloads.
+pub const CHANNEL_CAPACITY: usize = 1_000_000;
+const ACK_CHANNEL_CAPACITY: usize = 1_000_000;
 
 /// Transaction reply message received from workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotTransactionReply {
     pub slot: u64,
+    pub worker_key: PublicKey,
     pub committed_transactions: Vec<u64>,
+}
+
+/// Early ACK message received from co-located worker when certificate forms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateAck {
+    pub acked_transactions: Vec<u64>,
 }
 
 /// Client configuration parameters.
@@ -36,6 +44,11 @@ pub struct ClientParameters {
     pub worker_count: usize,
     /// The number of reply confirmations required before marking a transaction as committed.
     pub threshold: usize,
+    /// How long the client should send transactions before initiating shutdown.
+    pub duration: Duration,
+    /// Timeout duration in milliseconds for waiting for early ACKs before retrying to remaining workers.
+    /// If 0, timeout mechanism is disabled.
+    pub transaction_timeout: u64,
 }
 
 impl Default for ClientParameters {
@@ -45,6 +58,8 @@ impl Default for ClientParameters {
             transaction_rate: 1000,
             worker_count: 1,
             threshold: 1,
+            duration: Duration::from_secs(20),
+            transaction_timeout: 150, // 150ms default timeout
         }
     }
 }
@@ -59,6 +74,10 @@ pub struct Client {
     parameters: ClientParameters,
     /// The address where this client listens for replies.
     reply_address: SocketAddr,
+    /// The address where this client listens for early ACKs.
+    ack_address: SocketAddr,
+    /// Metrics collector responsible for persisting latency information.
+    metrics: MetricsCollector,
 }
 
 impl Client {
@@ -67,25 +86,47 @@ impl Client {
         committee: Committee,
         parameters: ClientParameters,
         reply_address: SocketAddr,
-    ) {
+        ack_address: SocketAddr,
+        metrics_path: PathBuf,
+    ) -> MetricsCollector {
+        let metrics = match MetricsCollector::spawn(client_id, metrics_path) {
+            Ok(collector) => collector,
+            Err(e) => {
+                warn!(
+                    "Failed to initialise metrics collector for client {}: {}. Falling back to no-op collector.",
+                    client_id, e
+                );
+                MetricsCollector::noop(client_id)
+            }
+        };
+
         // Define a client instance.
         let client = Self {
             client_id,
             committee,
             parameters,
             reply_address,
+            ack_address,
+            metrics,
         };
 
         // NOTE: These log entries are used to compute performance.
-        info!("Transactions size: {} B", client.parameters.transaction_size);
-        info!("Transactions rate: {} tx/s", client.parameters.transaction_rate);
+        info!(
+            "Transactions size: {} B",
+            client.parameters.transaction_size
+        );
+        info!(
+            "Transactions rate: {} tx/s",
+            client.parameters.transaction_rate
+        );
 
         // Add this client to the committee configuration if not already present
         // This allows workers to find this client's reply address
         // In production, this would be done through proper service registration
-        
+
         // Spawn client tasks
-        client.handle_transaction_sending();
+        let ack_tx = client.handle_ack_receiving();
+        client.handle_transaction_sending(ack_tx);
         client.handle_reply_receiving();
 
         // NOTE: This log entry is used to compute performance.
@@ -93,16 +134,35 @@ impl Client {
             "Client {} successfully started, listening for replies on {}",
             client_id, reply_address
         );
+
+        client.metrics.clone()
+    }
+
+    /// Spawn the ACK receiving component and return the receiver for ACKs.
+    fn handle_ack_receiving(&self) -> tokio::sync::mpsc::Receiver<Vec<u64>> {
+        let (tx_ack, rx_ack) = tokio::sync::mpsc::channel(ACK_CHANNEL_CAPACITY);
+
+        // Listen for early ACKs from co-located worker
+        let mut address = self.ack_address;
+        address.set_ip("0.0.0.0".parse().unwrap());
+        Receiver::spawn(address, AckReceiverHandler { tx_ack });
+
+        info!(
+            "Client {} listening for early ACKs on {}",
+            self.client_id, address
+        );
+
+        rx_ack
     }
 
     /// Spawn the transaction sending component.
-    fn handle_transaction_sending(&self) {
+    fn handle_transaction_sending(&self, ack_rx: tokio::sync::mpsc::Receiver<Vec<u64>>) {
         // Starting transaction sender
-        
+
         // Get worker addresses from committee in ID order for same-ID mapping
         let mut authorities_by_id: Vec<_> = self.committee.authorities.values().collect();
         authorities_by_id.sort_by_key(|authority| authority.id);
-        
+
         let worker_addresses: Vec<SocketAddr> = authorities_by_id
             .iter()
             .flat_map(|authority| authority.workers.values())
@@ -113,6 +173,8 @@ impl Client {
             self.client_id,
             worker_addresses,
             self.parameters.clone(),
+            self.metrics.clone(),
+            ack_rx,
         );
     }
 
@@ -123,16 +185,14 @@ impl Client {
         // Listen for replies from workers
         let mut address = self.reply_address;
         address.set_ip("0.0.0.0".parse().unwrap());
-        Receiver::spawn(
-            address,
-            ReplyReceiverHandler { tx_reply_processor },
-        );
+        Receiver::spawn(address, ReplyReceiverHandler { tx_reply_processor });
 
         // Process received replies
         ReplyProcessor::spawn(
             self.client_id,
             rx_reply_processor,
             self.parameters.threshold,
+            self.metrics.clone(),
         );
 
         // Listening for replies
@@ -152,12 +212,30 @@ impl MessageHandler for ReplyReceiverHandler {
         match bincode::deserialize::<SlotTransactionReply>(&message) {
             Ok(reply) => {
                 // Received reply for slot
-                
+                // Log every reply received
+                let capacity = self.tx_reply_processor.capacity();
+                info!(
+                    "RX: Client got slot {} with {} txs (ch cap: {})",
+                    reply.slot,
+                    reply.committed_transactions.len(),
+                    capacity
+                );
+
+                // Check if channel is full
+                if capacity == 0 {
+                    warn!("BOTTLENECK: Reply channel FULL!");
+                }
+
+                // Send to reply processor - don't panic on error
+                if let Err(_) = self.tx_reply_processor.send(reply).await {
+                    warn!("DROPPED: Failed to send reply to processor!");
+                }
+
                 // Send to reply processor
-                self.tx_reply_processor
-                    .send(reply)
-                    .await
-                    .expect("Failed to send reply to processor");
+                /*self.tx_reply_processor
+                .send(reply)
+                .await
+                .expect("Failed to send reply to processor");*/
             }
             Err(e) => {
                 warn!("Failed to deserialize reply message: {}", e);
@@ -166,6 +244,31 @@ impl MessageHandler for ReplyReceiverHandler {
 
         // Give the chance to schedule other tasks
         tokio::task::yield_now().await;
+        Ok(())
+    }
+}
+
+/// Handles incoming early ACK messages from the co-located worker.
+#[derive(Clone)]
+struct AckReceiverHandler {
+    tx_ack: tokio::sync::mpsc::Sender<Vec<u64>>,
+}
+
+#[async_trait]
+impl MessageHandler for AckReceiverHandler {
+    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        // Deserialize the ACK message
+        match bincode::deserialize::<CertificateAck>(&message) {
+            Ok(ack) => {
+                // Received early ACK - forward to TransactionSender
+                if let Err(_) = self.tx_ack.send(ack.acked_transactions).await {
+                    warn!("Failed to send ACK to TransactionSender");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to deserialize ACK message: {}", e);
+            }
+        }
         Ok(())
     }
 }
@@ -181,6 +284,7 @@ mod tests {
         assert_eq!(params.transaction_rate, 1000);
         assert_eq!(params.worker_count, 1);
         assert_eq!(params.threshold, 1);
+        assert_eq!(params.duration, Duration::from_secs(20));
     }
 
     #[tokio::test]
@@ -188,8 +292,18 @@ mod tests {
         let committee = Committee::new(vec![]);
         let parameters = ClientParameters::default();
         let reply_address = "127.0.0.1:8000".parse().unwrap();
-        
+        let ack_address = "127.0.0.1:8001".parse().unwrap();
+
         // This should not panic
-        Client::spawn(0, committee, parameters, reply_address);
+        let metrics_path = PathBuf::from("client-test.metrics");
+        let metrics = Client::spawn(
+            0,
+            committee,
+            parameters,
+            reply_address,
+            ack_address,
+            metrics_path,
+        );
+        metrics.shutdown().await;
     }
 }
