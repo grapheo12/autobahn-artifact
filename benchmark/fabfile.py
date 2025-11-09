@@ -13,13 +13,16 @@ from benchmark.remote import Bench, BenchError
 def local(ctx, debug=True):
     ''' Run benchmarks on localhost '''
     bench_params = {
-        'faults': 0, 
+        'faults': 0,
         'nodes': 4,
         'workers': 1,
         'worker_fault_tolerance': 2,  # Number of workers each client sends to
         'rate': 10_000,
         'tx_size': 512,
-        'duration': 60,
+        'duration': 20,
+        'latency_warmup': 2,
+        'latency_cooldown': 2,
+        'transaction_timeout': 120,  # ms - timeout for early ACKs before retry
 
         # Unused
         'simulate_partition': True,
@@ -37,6 +40,8 @@ def local(ctx, debug=True):
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 1,  # ms
         'use_optimistic_tips': True,
+        'use_threshold_random_coin': True,
+        'optimistic_leader_only': False,
         'use_parallel_proposals': True,
         'k': 4,
         'use_fast_path': True,
@@ -45,12 +50,12 @@ def local(ctx, debug=True):
         'car_timeout': 200,
         'start_slot_rounds': 1,
 
-        'simulate_asynchrony': True,
-        'asynchrony_type': [4],
+        'simulate_asynchrony': False,
+        'asynchrony_type': [2],
 
-        'asynchrony_start': [0], #ms
-        'asynchrony_duration': [70_000], #ms
-        'affected_nodes': [4],
+        'asynchrony_start': [10_000], #ms
+        'asynchrony_duration': [2_000], #ms
+        'affected_nodes': [1],
         'egress_penalty': 25, #ms
 
         'use_fast_sync': False,
@@ -126,10 +131,13 @@ def remote(ctx, debug=True):
         'workers': 1,
         'worker_fault_tolerance': 2,  # Number of workers each client sends to
         'co-locate': True,
-        'rate': [10_000],
+        'rate': [100_000],
         'tx_size': 512,
         'duration': 20,
         'runs': 1,
+        'latency_warmup': 2,
+        'latency_cooldown': 2,
+        'transaction_timeout': 150,  # ms - timeout for early ACKs before retry
 
         # Unused
         'simulate_partition': True,
@@ -145,17 +153,19 @@ def remote(ctx, debug=True):
         'sync_retry_delay': 1_000,  # ms
         'sync_retry_nodes': 4,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200,  # ms
-        'use_optimistic_tips': False,
+        'max_batch_delay': 20,  # ms
+        'use_optimistic_tips': True,
+        'use_threshold_random_coin': True,
+        'optimistic_leader_only': False,
         'use_parallel_proposals': True,
-        'k': 1,
+        'k': 4,
         'use_fast_path': True,
-        'fast_path_timeout': 200,
+        'fast_path_timeout': 300,
         'use_ride_share': False,
         'car_timeout': 2000,
         'start_slot_rounds': 1,
 
-        'simulate_asynchrony': True,
+        'simulate_asynchrony': False,
         'asynchrony_type': [3],
 
         'asynchrony_start': [10_000], #ms
@@ -163,8 +173,8 @@ def remote(ctx, debug=True):
         'affected_nodes': [2],
         'egress_penalty': 50, #ms
 
-        'use_fast_sync': True,
-        'use_exponential_timeouts': True,
+        'use_fast_sync': False,
+        'use_exponential_timeouts': False,
     }
     try:
         Bench(ctx).run(bench_params, node_params, debug)
