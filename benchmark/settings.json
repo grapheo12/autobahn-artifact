@@ -1,21 +1,21 @@
 {
     "key": {
         "name": "",
-        "path": "/home/ubuntu/.ssh/local-to-control-machine.pem"
+        "path": "/home/ubuntu/.ssh/local-to-control-machine-home.pem"
     },
     "port": 5000,
     "repo": {
         "name": "ambulance",
         "url": "https://github.com/neilgiri/ambulance.git",
-        "branch": "ambulance-blips"
+        "branch": "autobahn-blips-client-timeouts"
     },
     "project_id": "<PROJECT_ID>",
     "username": "ubuntu",
     "instances": {
-        "type": "m5a.xlarge",
-        "regions": ["us-east-1"],
-        "templates": ["ambulance-node-template"],
-        "template_ids": ["lt-0117a53d9a3949716"],
-        "template_versions": ["5"]
+        "type": "m6a.4xlarge",
+        "regions": ["us-east-1", "us-east-2", "us-west-1", "us-west-2"],
+        "templates": ["ambulance-node-template", "ambulance-node-template-ohio", "ambulance-node-template-california", "ambulance-node-template-oregon"],
+        "template_ids": ["lt-0117a53d9a3949716", "lt-0db75769aab87ecbc", "lt-070805926427b8369", "lt-014180a7636d35b2c"],
+        "template_versions": ["8", "2", "3", "2"]
     }
 }

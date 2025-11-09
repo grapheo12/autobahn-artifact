@@ -5,9 +5,13 @@ from os.path import basename, splitext
 from time import sleep
 
 from benchmark.commands import CommandMaker
-from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
+from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError, TSSKey
 from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
+from benchmark.settings import Settings
+
+
+CLIENT_SHUTDOWN_GRACE = 12
 
 
 class LocalBench:
@@ -17,6 +21,7 @@ class LocalBench:
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
+            self.settings = Settings.load('settings.json')
         except ConfigError as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
@@ -67,9 +72,23 @@ class LocalBench:
                 subprocess.run(cmd, check=True)
                 keys += [Key.from_file(filename)]
 
-
+            # Generate threshold signature files (skip for autobahn-blips-client-timeouts branch).
             names = [x.name for x in keys]
-            ids = [i for i in range(len(keys))]
+            if self.settings.branch != 'autobahn-blips-client-timeouts':
+                cmd = './node threshold_keys'
+                for i in range(nodes):
+                    cmd += ' --filename ' + PathMaker.threshold_key_file(i)
+                # print(cmd)
+                cmd = cmd.split()
+                subprocess.run(cmd, capture_output=True, check=True)
+
+                tss_keys = []
+                for i in range(nodes):
+                    tss_keys += [TSSKey.from_file(PathMaker.threshold_key_file(i))]
+                ids = [x.id for x in tss_keys]
+            else:
+                # For autobahn-blips-client-timeouts branch, use sequential IDs based on key index
+                ids = list(range(nodes))
             #print('num workers', self.workers)
             committee = LocalCommittee(names, ids, self.BASE_PORT, self.workers)
             committee.print(PathMaker.committee_file())
@@ -80,10 +99,12 @@ class LocalBench:
             for i, address in enumerate(committee.primary_addresses(self.faults)):
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
+                    PathMaker.threshold_key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
-                    debug=debug
+                    debug=debug,
+                    branch=self.settings.branch
                 )
                 log_file = PathMaker.primary_log_file(i)
                 print(cmd)
@@ -95,11 +116,13 @@ class LocalBench:
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
+                        PathMaker.threshold_key_file(i),
                         PathMaker.committee_file(),
                         PathMaker.db_path(i, id),
                         PathMaker.parameters_file(),
                         id,  # The worker's id.
-                        debug=debug
+                        debug=debug,
+                        branch=self.settings.branch
                     )
                     log_file = PathMaker.worker_log_file(i, id)
                     self._background_run(cmd, log_file)
@@ -110,25 +133,33 @@ class LocalBench:
 
             # Run the clients (after workers are ready).
             client_addresses = committee.client_addresses()
+            client_ack_addresses = committee.client_ack_addresses()
             rate_share = ceil(rate / committee.workers())
             f = floor((nodes - 1) / 3)
             Print.info(f"f: {f}")
             client_id = 0
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
-                    # Get the corresponding client reply address
+                    # Get the corresponding client reply and ack addresses
                     if client_id < len(client_addresses):
                         reply_addr = client_addresses[client_id]
+                        ack_addr = client_ack_addresses[client_id]
                         cmd = CommandMaker.run_client(
                             client_id,
                             reply_addr,
+                            ack_addr,
                             PathMaker.committee_file(),
                             PathMaker.key_file(i),
+                            PathMaker.threshold_key_file(i),
                             f'.db-client-{client_id}',
                             self.tx_size,
                             rate_share,
                             self.worker_fault_tolerance,
-                            threshold=f+1
+                            threshold=f+1,
+                            duration=self.duration,
+                            branch=self.settings.branch,
+                            metrics_file=PathMaker.client_metrics_file(i, id),
+                            transaction_timeout=self.transaction_timeout
                         )
                         log_file = PathMaker.client_log_file(i, id)
                         print(f"Client {client_id} command: {cmd}")
@@ -136,13 +167,23 @@ class LocalBench:
                     client_id += 1
 
             # Wait for all transactions to be processed.
-            Print.info(f'Running benchmark ({self.duration} sec)...')
-            sleep(self.duration)
+            total_run = self.duration + CLIENT_SHUTDOWN_GRACE
+            Print.info(f'Running benchmark ({self.duration} sec + {CLIENT_SHUTDOWN_GRACE} sec drain)...')
+            sleep(total_run)
             self._kill_nodes()
+
+            # Wait for nodes to gracefully shutdown and flush metrics to disk
+            Print.info('Waiting for nodes to shutdown...')
+            sleep(1)
 
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            return LogParser.process(
+                PathMaker.logs_path(),
+                faults=self.faults,
+                warmup_seconds=self.latency_warmup,
+                cooldown_seconds=self.latency_cooldown,
+            )
 
         except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()

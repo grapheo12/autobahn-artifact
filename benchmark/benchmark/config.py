@@ -19,6 +19,19 @@ class Key:
             data = load(f)
         return cls(data['name'], data['secret'])
 
+class TSSKey:
+    def __init__(self, id, name, secret):
+        self.id = id
+        self.name = name
+        self.secret = secret
+
+    @classmethod
+    def from_file(cls, filename):
+        assert isinstance(filename, str)
+        with open(filename, 'r') as f:
+            data = load(f)
+        return cls(data['id'], data['name'], data['secret'])
+
 
 class Committee:
     ''' The committee looks as follows:
@@ -113,9 +126,10 @@ class Committee:
             num_workers = len(hosts) - 1
             for worker_idx in range(num_workers):
                 self.json['clients'][str(client_id)] = {
-                    'replies': f'{primary_host}:{port}'
+                    'replies': f'{primary_host}:{port}',
+                    'transaction_acks': f'{primary_host}:{port + 1}'
                 }
-                port += 1
+                port += 2
                 client_id += 1
 
     def primary_addresses(self, faults=0):
@@ -144,6 +158,12 @@ class Committee:
         if 'clients' not in self.json:
             return []
         return [client['replies'] for client in self.json['clients'].values()]
+
+    def client_ack_addresses(self):
+        ''' Returns an ordered list of client transaction ACK addresses. '''
+        if 'clients' not in self.json:
+            return []
+        return [client['transaction_acks'] for client in self.json['clients'].values()]
 
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''
@@ -259,6 +279,8 @@ class BenchParameters:
 
             self.duration = int(json['duration'])
 
+            self.transaction_timeout = int(json.get('transaction_timeout', 150))
+
             self.runs = int(json['runs']) if 'runs' in json else 1
             self.simulate_partition = bool(json['simulate_partition'])
 
@@ -270,6 +292,15 @@ class BenchParameters:
 
         except ValueError:
             raise ConfigError('Invalid parameters type')
+
+        try:
+            self.latency_warmup = float(json.get('latency_warmup', 0))
+            self.latency_cooldown = float(json.get('latency_cooldown', 0))
+        except (TypeError, ValueError):
+            raise ConfigError('Invalid latency warmup/cooldown type')
+
+        if self.latency_warmup < 0 or self.latency_cooldown < 0:
+            raise ConfigError('Latency warmup/cooldown must be non-negative')
 
         if min(self.nodes) <= self.faults:
             raise ConfigError('There should be more nodes than faults')

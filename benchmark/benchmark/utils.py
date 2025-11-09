@@ -31,6 +31,11 @@ class PathMaker:
     def key_file(i):
         assert isinstance(i, int) and i >= 0
         return f'.node-{i}.json'
+    
+    @staticmethod
+    def threshold_key_file(i):
+        assert isinstance(i, int) and i >= 0
+        return f'.node-tss-{i}.json'
 
     @staticmethod
     def db_path(i, j=None):
@@ -59,6 +64,12 @@ class PathMaker:
         assert isinstance(i, int) and i >= 0
         assert isinstance(j, int) and i >= 0
         return join(PathMaker.logs_path(), f'client-{i}-{j}.log')
+
+    @staticmethod
+    def client_metrics_file(i, j):
+        assert isinstance(i, int) and i >= 0
+        assert isinstance(j, int) and i >= 0
+        return join(PathMaker.logs_path(), f'client-{i}-{j}.metrics')
 
     @staticmethod
     def results_path():

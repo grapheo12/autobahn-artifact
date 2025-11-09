@@ -19,8 +19,6 @@ use primary::Header;
 use primary::Primary;
 use std::path::PathBuf;
 use store::Store;
-use threshold_crypto::serde_impl::SerdeSecret;
-use threshold_crypto::SecretKeySet;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::time::Duration;
 use worker::Worker;
@@ -43,19 +41,9 @@ async fn main() -> Result<()> {
                 .args_from_usage("--filename=<FILE> 'The file where to print the new key pair'"),
         )
         .subcommand(
-            SubCommand::with_name("threshold_keys")
-                .about("Print fresh threshold key pairs to files")
-                .args_from_usage(
-                    "--filename=<FILE>... 'The files where to print the new key pairs'",
-                ),
-        )
-        .subcommand(
             SubCommand::with_name("run")
                 .about("Run a node")
                 .args_from_usage("--keys=<FILE> 'The file containing the node keys'")
-                .args_from_usage(
-                    "--threshold_keys=<FILE> 'The file containing the node threshold_keys'",
-                )
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
@@ -109,7 +97,6 @@ async fn main() -> Result<()> {
 // Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
-    let threshold_key_file = matches.value_of("threshold_keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();

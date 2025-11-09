@@ -5,6 +5,11 @@ from multiprocessing import Pool
 from os.path import join
 from re import findall, search
 from statistics import mean
+import csv
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
 
 from benchmark.utils import Print
 
@@ -13,64 +18,172 @@ class ParseError(Exception):
     pass
 
 
-class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
-        inputs = [clients, primaries, workers]
-        assert all(isinstance(x, list) for x in inputs)
-        assert all(isinstance(x, str) for y in inputs for x in y)
-        assert all(x for x in inputs)
+class ClientMetricsData:
+    """Structured metrics extracted from the per-client metrics file using pandas."""
 
-        self.faults = faults
-        if isinstance(faults, int):
-            self.committee_size = len(primaries) + int(faults)
-            self.workers = len(workers) // len(primaries)
-        else:
-            self.committee_size = '?'
-            self.workers = '?'
+    def __init__(self, client_id, df):
+        self.client_id = client_id
+        self.df = df
 
-        # Parse the clients logs.
+    @classmethod
+    def from_file(cls, path):
         try:
-            with Pool() as p:
-                results = p.map(self._parse_clients, clients)
-        except (ValueError, IndexError, AttributeError) as e:
-            raise ParseError(f'Failed to parse clients\' logs: {e}')
+            # Read CSV with optimized dtypes
+            df = pd.read_csv(
+                path,
+                dtype={
+                    'client_id': 'uint8',
+                    'tx_id': 'uint64',
+                    'is_sample': 'uint8',
+                    'send_ns': 'uint64',
+                    'commit_ns': 'uint64',
+                    'latency_ns': 'uint64'
+                },
+                engine='c'
+            )
+
+            if df.empty:
+                return None
+
+            # Ensure we keep the earliest commit per (client_id, tx_id)
+            df = df.sort_values(['commit_ns', 'send_ns'])
+            before = len(df)
+            df = df.drop_duplicates(subset=['client_id', 'tx_id'], keep='first')
+            df.attrs['dedup_dropped'] = before - len(df)
+
+            # Vectorized time conversion from nanoseconds to seconds
+            df['send_time'] = df['send_ns'] / 1_000_000_000.0
+            df['commit_time'] = df['commit_ns'] / 1_000_000_000.0
+
+            client_id = int(df['client_id'].iloc[0])
+            return cls(client_id, df)
+
+        except (OSError, pd.errors.EmptyDataError, KeyError):
+            return None
+
+
+
+class LogParser:
+    def __init__(
+        self,
+        clients,
+        primaries,
+        workers,
+        metrics_map,
+        metrics_by_file=None,
+        faults=0,
+        parameters=None,
+        committee=None,
+        client_files=None,
+        warmup_seconds=0,
+        cooldown_seconds=0,
+    ):
+        assert isinstance(clients, list) and all(isinstance(x, str) for x in clients)
+        assert isinstance(primaries, list) and all(isinstance(x, str) for x in primaries)
+        assert isinstance(workers, list) and all(isinstance(x, str) for x in workers)
+
+        self.metrics_map = metrics_map or {}
+        self.metrics_by_file = metrics_by_file or {}
+        self.faults = faults
+        self.parameters = parameters or {}
+        self.committee = committee or {}
+        self.client_files = [Path(p) for p in (client_files or [])]
+        try:
+            self.latency_warmup = max(0.0, float(warmup_seconds))
+            self.latency_cooldown = max(0.0, float(cooldown_seconds))
+        except (TypeError, ValueError):
+            raise ParseError('Invalid warmup/cooldown durations')
+
+        if self.committee:
+            authorities = self.committee.get('authorities', {})
+            self.committee_size = len(authorities)
+            if authorities:
+                first = next(iter(authorities.values()))
+                self.workers = len(first.get('workers', {}))
+            else:
+                self.workers = '?'
+        else:
+            if isinstance(faults, int):
+                self.committee_size = len(primaries) + int(faults)
+                self.workers = len(workers) // len(primaries) if primaries else '?'
+            else:
+                self.committee_size = '?'
+                self.workers = '?'
+
+        # Parse the clients. Prefer metrics files when available to avoid heavy log parsing.
+        client_results = []
+        missing = []
+        for idx, log in enumerate(clients):
+            client_path = self.client_files[idx] if idx < len(self.client_files) else None
+            result = self._parse_clients_from_metrics(log, client_path)
+            if result is None:
+                name = (
+                    self.client_files[idx].name
+                    if idx < len(self.client_files)
+                    else f"client-{idx}"
+                )
+                missing.append(name)
+            client_results.append(result)
+
+        if missing:
+            names = ', '.join(missing)
+            raise ParseError(f'Metrics file missing for client log(s): {names}')
+
+        # Pure pandas implementation - only store essential metadata
         (
             self.size,
             self.rate,
             self.start,
             misses,
-            self.sent_samples,
-            self.client_commits,
-            self.all_sent_transactions,
-        ) = zip(*results)
+        ) = zip(*client_results)
         self.misses = sum(misses)
 
-        # Collate client-side observations to keep earliest timestamps per transaction.
-        self.sample_sends = self._aggregate_transactions(self.sent_samples)
-        self.transaction_sends = self._aggregate_transactions(self.all_sent_transactions)
-        self.committed_transactions = self._aggregate_transactions(self.client_commits)
+        # Aggregate using metrics files (required).
+        if not self.metrics_map and self.metrics_by_file:
+            for data in self.metrics_by_file.values():
+                self.metrics_map.setdefault(data.client_id, data)
 
-        # Parse the primaries logs.
-        try:
-            with Pool() as p:
-                results = p.map(self._parse_primaries, primaries)
-        except (ValueError, IndexError, AttributeError) as e:
-            raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, self.configs, primary_ips = zip(*results)
-        self.proposals = self._merge_results([x.items() for x in proposals])
-        self.commits = self._merge_results([x.items() for x in commits])
+        if not self.metrics_map:
+            raise ParseError('Metrics files are required for client aggregation')
 
-        # Parse the workers logs.
-        try:
-            with Pool() as p:
-                results = p.map(self._parse_workers, workers)
-        except (ValueError, IndexError, AttributeError) as e:
-            raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, workers_ips = zip(*results)
-        self.sizes = {k: v for x in sizes for k, v in x.items() if k in self.commits}
+        total_dedup = 0
 
-        # Determine whether the primary and the workers are collocated.
-        self.collocate = set(primary_ips) == set(workers_ips)
+        # Concatenate all client DataFrames for efficient processing
+        all_dfs = []
+        for data in self.metrics_map.values():
+            if data.df is not None and not data.df.empty:
+                total_dedup += data.df.attrs.get('dedup_dropped', 0)
+                all_dfs.append(data.df)
+
+        if total_dedup:
+            Print.warn(f'Dropped {total_dedup:,} duplicate commits while loading metrics')
+
+        if all_dfs:
+            self.all_metrics_df = pd.concat(all_dfs, ignore_index=True)
+
+            # Validate no duplicate transactions - each (client_id, tx_id) should be unique
+            duplicates = self.all_metrics_df.duplicated(subset=['client_id', 'tx_id'], keep=False)
+            if duplicates.any():
+                dup_count = duplicates.sum()
+                dup_samples = self.all_metrics_df[duplicates][['client_id', 'tx_id']].head(10)
+                Print.warn(f'Found {dup_count} duplicate transactions! Sample: {dup_samples.values.tolist()}')
+        else:
+            self.all_metrics_df = pd.DataFrame()
+
+        # NOTE: Primaries/workers parsing is disabled; use provided parameters instead.
+        self.proposals = {}
+        self.commits = {}
+        self.configs = [{
+            'header_size': self.parameters.get('header_size', 0),
+            'max_header_delay': self.parameters.get('max_header_delay', 0),
+            'gc_depth': self.parameters.get('gc_depth', 0),
+            'sync_retry_delay': self.parameters.get('sync_retry_delay', 0),
+            'sync_retry_nodes': self.parameters.get('sync_retry_nodes', 0),
+            'batch_size': self.parameters.get('batch_size', 0),
+            'max_batch_delay': self.parameters.get('max_batch_delay', 0),
+        }]
+        self.collocate = self._compute_collocate_from_committee()
+        self.sizes = {}
 
         # Check whether clients missed their target rate.
         if self.misses != 0:
@@ -86,53 +199,88 @@ class LogParser:
                 if not k in merged or merged[k] > v:
                     merged[k] = v
         return merged
+    
+    def _compute_collocate_from_committee(self):
+        authorities = self.committee.get('authorities', {})
+        if not authorities:
+            return False
 
-    def _aggregate_transactions(self, dicts):
-        aggregated = {}
-        for d in dicts:
-            for k, v in d.items():
-                if k not in aggregated or v < aggregated[k]:
-                    aggregated[k] = v
-        return aggregated
+        for info in authorities.values():
+            primary_addr = info.get('primary', {}).get('primary_to_primary')
+            if not primary_addr:
+                return False
+            primary_ip = primary_addr.split(':')[0]
+
+            workers = info.get('workers', {})
+            for worker_info in workers.values():
+                tx_addr = worker_info.get('transactions')
+                if not tx_addr:
+                    return False
+                worker_ip = tx_addr.split(':')[0]
+                if worker_ip != primary_ip:
+                    return False
+        return True
+    
+    def _parse_clients_from_metrics(self, log, client_path=None):
+        size_match = search(r'Transactions size: (\d+)', log)
+        size = int(size_match.group(1)) if size_match else 0
+        rate_match = search(r'Transactions rate: (\d+)', log)
+        rate = int(rate_match.group(1)) if rate_match else 0
+        misses = len(findall(r'rate too high', log))
+
+        client_match = search(r'Client (\d+) Start sending transactions', log)
+        if client_match is None:
+            client_match = search(r'Client (\d+) sending sample transaction', log)
+        if client_match is None:
+            client_match = search(r'Client (\d+) successfully started', log)
+        client_id = int(client_match.group(1)) if client_match else None
+
+        metrics_entry = None
+        if client_id is not None:
+            metrics_entry = self.metrics_map.get(client_id)
+        if metrics_entry is None and client_path is not None:
+            metrics_entry = self.metrics_by_file.get(client_path.name)
+        if metrics_entry is None and client_path is not None:
+            metrics_entry = ClientMetricsData.from_file(client_path.with_suffix('.metrics'))
+            if metrics_entry is not None:
+                self.metrics_map.setdefault(metrics_entry.client_id, metrics_entry)
+                self.metrics_by_file.setdefault(client_path.name, metrics_entry)
+        if metrics_entry is None:
+            return None
+
+        # Pure pandas implementation - only return essential metadata
+        start = metrics_entry.df['send_time'].min() if not metrics_entry.df.empty else 0
+        return size, rate, start, misses
 
     def _parse_clients(self, log):
         if search(r'Error', log) is not None:
             raise ParseError('Client(s) panicked')
 
-        size = int(search(r'Transactions size: (\d+)', log).group(1))
-        rate = int(search(r'Transactions rate: (\d+)', log).group(1))
+        size_match = search(r'Transactions size: (\d+)', log)
+        size = int(size_match.group(1)) if size_match else 0
+        rate_match = search(r'Transactions rate: (\d+)', log)
+        rate = int(rate_match.group(1)) if rate_match else 0
 
-        tmp = search(r'\[(.*Z) .* Start ', log).group(1)
-        start = self._to_posix(tmp)
+        start_match = search(r'\[(.*Z) .* Start ', log)
+        start = self._to_posix(start_match.group(1)) if start_match else 0
 
         misses = len(findall(r'rate too high', log))
 
-        tmp = findall(r'\[(.*Z) .* sending sample transaction (\d+) from client (\d+)', log)
-        samples = {}
-        for t, s, c in tmp:
-            key = (int(s), int(c))
-            samples.setdefault(key, self._to_posix(t))
+        client_match = search(r'Client (\d+) Start sending transactions', log)
+        if client_match is None:
+            client_match = search(r'Client (\d+) sending sample transaction', log)
+        if client_match is None:
+            client_match = search(r'Client (\d+) successfully started', log)
+        client_id = int(client_match.group(1)) if client_match else None
 
-        # Parse regular transaction sends
-        tmp = findall(r'\[(.*Z) .* sending regular transaction (\d+) from client (\d+)', log)
-        regular_sends = {}
-        for t, s, c in tmp:
-            key = (int(s), int(c))
-            regular_sends.setdefault(key, self._to_posix(t))
+        if client_id is not None:
+            metrics_entry = self.metrics_map.get(client_id)
+            if metrics_entry:
+                # Pandas-only implementation - fallback not supported
+                raise ParseError('Fallback parsing from logs not supported - metrics files required')
 
-        # Combine sample and regular transaction send times
-        all_sends = {}
-        all_sends.update(samples)
-        all_sends.update(regular_sends)
-
-        # Parse transaction commits - extract both client_id and transaction counter
-        tmp = findall(r'\[(.*Z) .* Client (\d+) transaction (\d+) committed', log)
-        commits = {}
-        for t, client_id, tx_counter in tmp:
-            key = (int(tx_counter), int(client_id))
-            commits.setdefault(key, self._to_posix(t))
-
-        return size, rate, start, misses, samples, commits, all_sends
+        # Old regex-based parsing - not supported anymore
+        raise ParseError('Fallback parsing from logs not supported - metrics files required')
 
     def _parse_primaries(self, log):
         if search(r'(?:panicked|Error)', log) is not None:
@@ -184,7 +332,6 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains (\d+) B', log)
         sizes = {d: int(s) for d, s in tmp}
 
-        # Extract sample transactions for latency measurement
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
         return sizes, ip
@@ -193,131 +340,129 @@ class LogParser:
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
         return datetime.timestamp(x)
 
-    def _consensus_throughput(self):
-        if not self.commits:
-            return 0, 0, 0
-        start, end = min(self.proposals.values()), max(self.commits.values())
-        duration = end - start
-        
-        committed_keys = [
-            key for key in self.committed_transactions.keys() if key in self.transaction_sends
-        ]
-        if not committed_keys or duration <= 0:
-            return 0, 0, duration
-
-        unique_tx_count = len(committed_keys)
-        bytes = unique_tx_count * self.size[0]
-        bps = bytes / duration
-        tps = bps / self.size[0]
-        return tps, bps, duration
-
     def _consensus_latency(self):
         latency = [c - self.proposals[d] for d, c in self.commits.items()]
         return mean(latency) if latency else 0
 
+    def _per_client_throughput(self):
+        """Compute throughput by summing per-client contributions using vectorized operations."""
+        if not self.metrics_map or not self.size:
+            return 0, 0, 0
+
+        size_bytes = self.size[0]
+        total_tps = 0.0
+        total_bps = 0.0
+        durations = []
+
+        for data in self.metrics_map.values():
+            if data.df is None or data.df.empty:
+                continue
+
+            # Vectorized operations on DataFrame
+            df = data.df
+            start = df['send_time'].min()
+            end = df['commit_time'].max()
+            duration = end - start
+
+            if duration <= 0:
+                continue
+
+            tx_count = len(df)
+            client_tps = tx_count / duration
+            client_bps = (tx_count * size_bytes) / duration
+
+            total_tps += client_tps
+            total_bps += client_bps
+            durations.append(duration)
+
+        overall_duration = max(durations) if durations else 0
+        return total_tps, total_bps, overall_duration
+
     def _end_to_end_throughput(self):
-        if not self.commits or not self.committed_transactions:
-            return 0, 0, 0
-
-        committed_keys = [
-            key for key in self.committed_transactions.keys() if key in self.transaction_sends
-        ]
-        if not committed_keys:
-            return 0, 0, 0
-
-        start = min(self.transaction_sends[key] for key in committed_keys)
-        end = max(self.committed_transactions[key] for key in committed_keys)
-        duration = end - start
-        if duration <= 0:
-            return 0, 0, 0
-
-        unique_tx_count = len(committed_keys)
-        print('Num unique transactions committed: ', unique_tx_count)
-        bytes = unique_tx_count * self.size[0]
-        bps = bytes / duration
-        tps = bps / self.size[0]
-        return tps, bps, duration
+        return self._per_client_throughput()
 
     def _end_to_end_latency(self):
-        sample_latency = []
-        all_latency = []
-        list_latencies = []
-        first_start = 0
-        
-        # Create combined dicts from aggregated data
-        all_sent_samples = self.sample_sends
-        all_sent_transactions = self.transaction_sends
-        all_client_commits = self.committed_transactions
+        """Compute end-to-end latency using vectorized pandas operations."""
+        if self.all_metrics_df.empty:
+            return {'mean': 0, 'p50': 0, 'p95': 0, 'p99': 0, 'p999': 0}
 
-        print('Num sent samples: ', len(all_sent_samples))
-        print('Num sent transactions: ', len(all_sent_transactions))
-        print('Num client commits: ', len(all_client_commits))
+        df = self.all_metrics_df.copy()
 
-        # Calculate latency for sample transactions (for mean)
-        for tx_id, send_time in all_sent_samples.items():
-            if tx_id in all_client_commits:
-                commit_time = all_client_commits[tx_id]
-                tx_latency = commit_time - send_time
+        # Vectorized latency calculation
+        df['latency'] = df['commit_time'] - df['send_time']
 
-                if first_start == 0 or send_time < first_start:
-                    first_start = send_time
+        # Track totals before trimming
+        total_samples = int(df['is_sample'].sum())
+        total_transactions = len(df)
+        first_send = df['send_time'].min()
+        last_commit = df['commit_time'].max()
 
-                sample_latency.append(tx_latency)
-                list_latencies.append((send_time - first_start, commit_time - first_start, tx_latency))
-            else:
-                print('tx_id not in all_client_commits: ', tx_id)
+        # Apply warmup/cooldown trimming
+        lower_bound = None
+        upper_bound = None
+        if self.latency_warmup > 0:
+            lower_bound = first_send + self.latency_warmup
+        if self.latency_cooldown > 0:
+            upper_bound = last_commit - self.latency_cooldown
+        if lower_bound is not None and upper_bound is not None and upper_bound <= lower_bound:
+            lower_bound = upper_bound = None
 
-        # Calculate latency for all transactions (for percentiles)
-        for tx_id, send_time in all_sent_transactions.items():
-            if tx_id in all_client_commits:
-                commit_time = all_client_commits[tx_id]
-                tx_latency = commit_time - send_time
+        # Vectorized filtering
+        original_len = len(df)
+        if lower_bound is not None:
+            df = df[df['send_time'] >= lower_bound]
+        if upper_bound is not None:
+            df = df[df['commit_time'] <= upper_bound]
 
-                all_latency.append(tx_latency)
+        trimmed_transactions = original_len - len(df)
+        trimmed_samples = total_samples - int(df['is_sample'].sum())
 
-        print('Num sample latencies: ', len(sample_latency))
-        print('Num all latencies: ', len(all_latency))
+        # Handle case where all transactions were trimmed
+        if df.empty and original_len > 0:
+            Print.warn('Warmup/cooldown trimming removed all transaction latencies; recomputing without trimming.')
+            df = self.all_metrics_df.copy()
+            df['latency'] = df['commit_time'] - df['send_time']
+            trimmed_samples = 0
+            trimmed_transactions = 0
 
-        list_latencies.sort(key=lambda tup: tup[0])
-        with open('latencies.txt', 'w') as f:
-            for line in list_latencies:
-                f.write(str(line[0]) + ',' + str(line[1]) + ',' + str((line[2])) + '\n')
-        
-        # Calculate mean and percentiles
-        #mean_latency = mean(sample_latency) if sample_latency else 0
-        mean_latency = mean(all_latency) if all_latency else 0
-
-        if all_latency:
-            sorted_latency = sorted(all_latency)
-            n = len(sorted_latency)
-
-            # Calculate percentiles
-            p50_idx = int(n * 0.50)
-            p95_idx = int(n * 0.95)
-            p99_idx = int(n * 0.99)
-            p999_idx = int(n * 0.999)
-
-            # Handle edge cases for small sample sizes
-            p50 = sorted_latency[min(p50_idx, n-1)]
-            p95 = sorted_latency[min(p95_idx, n-1)]
-            p99 = sorted_latency[min(p99_idx, n-1)]
-            p999 = sorted_latency[min(p999_idx, n-1)]
-
-            return {
-                'mean': mean_latency,
-                'p50': p50,
-                'p95': p95,
-                'p99': p99,
-                'p999': p999
-            }
+        # Write latencies.txt for sample transactions
+        sample_df = df[df['is_sample'] == 1].copy()
+        if not sample_df.empty:
+            first_start = sample_df['send_time'].min()
+            sample_df['start_offset'] = sample_df['send_time'] - first_start
+            sample_df['commit_offset'] = sample_df['commit_time'] - first_start
+            sample_df = sample_df.sort_values('start_offset')
+            sample_df[['start_offset', 'commit_offset', 'latency']].to_csv(
+                'latencies.txt', index=False, header=False
+            )
         else:
-            return {
-                'mean': mean_latency,
-                'p50': 0,
-                'p95': 0,
-                'p99': 0,
-                'p999': 0
-            }
+            # Write empty file if no samples
+            with open('latencies.txt', 'w') as f:
+                pass
+
+        print('Num sent samples:', total_samples, 'Trimmed:', trimmed_samples)
+        print('Num sent transactions:', total_transactions, 'Trimmed:', trimmed_transactions)
+        print('Num sample latencies:', int(df['is_sample'].sum()))
+        print('Num all latencies:', len(df))
+
+        if df.empty:
+            return {'mean': 0, 'p50': 0, 'p95': 0, 'p99': 0, 'p999': 0}
+
+        # Vectorized percentile calculations
+        latencies = df['latency'].values
+        mean_latency = float(latencies.mean())
+        p50 = float(np.percentile(latencies, 50))
+        p95 = float(np.percentile(latencies, 95))
+        p99 = float(np.percentile(latencies, 99))
+        p999 = float(np.percentile(latencies, 99.9))
+
+        return {
+            'mean': mean_latency,
+            'p50': p50,
+            'p95': p95,
+            'p99': p99,
+            'p999': p999
+        }
 
     def result(self):
         #timeout_delay = self.configs[0]['timeout_delay']
@@ -329,8 +474,6 @@ class LogParser:
         batch_size = self.configs[0]['batch_size']
         max_batch_delay = self.configs[0]['max_batch_delay']
 
-        consensus_latency = self._consensus_latency() * 1_000
-        consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         latency_stats = self._end_to_end_latency()
         end_to_end_latency = latency_stats['mean'] * 1_000
@@ -363,10 +506,9 @@ class LogParser:
             f' Max batch delay: {max_batch_delay:,} ms\n'
             '\n'
             ' + RESULTS:\n'
-            f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
-            f' Consensus BPS: {round(consensus_bps):,} B/s\n'
-            f' Consensus latency: {round(consensus_latency):,} ms\n'
-            '\n'
+            #f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
+            #f' Consensus BPS: {round(consensus_bps):,} B/s\n'
+            #f' Consensus latency: {round(consensus_latency):,} ms\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency (mean): {round(end_to_end_latency):,} ms\n'
@@ -383,20 +525,51 @@ class LogParser:
             f.write(self.result())
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, warmup_seconds=0, cooldown_seconds=0):
         assert isinstance(directory, str)
 
-        clients = []
-        for filename in sorted(glob(join(directory, 'client-*.log'))):
-            with open(filename, 'r') as f:
-                clients += [f.read()]
+        client_files = sorted(glob(join(directory, 'client-*.log')))
+        clients = [Path(path).read_text() for path in client_files]
         primaries = []
-        for filename in sorted(glob(join(directory, 'primary-*.log'))):
-            with open(filename, 'r') as f:
-                primaries += [f.read()]
         workers = []
-        for filename in sorted(glob(join(directory, 'worker-*.log'))):
-            with open(filename, 'r') as f:
-                workers += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        directory_path = Path(directory)
+        root = directory_path.parent
+        params_path = root / '.parameters.json'
+        committee_path = root / '.committee.json'
+
+        parameters = {}
+        committee = {}
+        if params_path.exists():
+            parameters = json.loads(params_path.read_text())
+        if committee_path.exists():
+            committee = json.loads(committee_path.read_text())
+
+        metrics_map, metrics_by_file = cls._load_metrics(client_files)
+
+        return cls(
+            clients,
+            primaries,
+            workers,
+            metrics_map,
+            metrics_by_file=metrics_by_file,
+            faults=faults,
+            parameters=parameters,
+            committee=committee,
+            client_files=client_files,
+            warmup_seconds=warmup_seconds,
+            cooldown_seconds=cooldown_seconds,
+        )
+
+    @staticmethod
+    def _load_metrics(client_files):
+        metrics_by_id = {}
+        metrics_by_file = {}
+        for log_path in client_files:
+            log_path = Path(log_path)
+            metrics_path = log_path.with_suffix('.metrics')
+            data = ClientMetricsData.from_file(metrics_path)
+            if data is not None:
+                metrics_by_id[data.client_id] = data
+                metrics_by_file[log_path.name] = data
+        return metrics_by_id, metrics_by_file

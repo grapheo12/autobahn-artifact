@@ -6,15 +6,17 @@ from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
 from os.path import basename, splitext
 from time import sleep
-from math import ceil
+from math import ceil, floor
 from copy import deepcopy
 import subprocess
 
-from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
+from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError, TSSKey
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
 from benchmark.aws_instance import InstanceManager
+
+CLIENT_SHUTDOWN_GRACE = 12
 
 
 class FabricError(Exception):
@@ -219,8 +221,23 @@ class Bench:
             subprocess.run(cmd, check=True)
             keys += [Key.from_file(filename)]
 
+        # Generate threshold signature files (skip for autobahn-blips-client-timeouts branch).
         names = [x.name for x in keys]
-        ids = [i for i in range(len(keys))]
+        if self.settings.branch != 'autobahn-blips-client-timeouts':
+            cmd = './node threshold_keys'
+            for i in range(len(hosts)):
+                cmd += ' --filename ' + PathMaker.threshold_key_file(i)
+            # print(cmd)
+            cmd = cmd.split()
+            subprocess.run(cmd, capture_output=True, check=True)
+
+            tss_keys = []
+            for i in range(len(hosts)):
+                tss_keys += [TSSKey.from_file(PathMaker.threshold_key_file(i))]
+            ids = [x.id for x in tss_keys]
+        else:
+            # For autobahn-blips-client-timeouts branch, use sequential IDs based on key index
+            ids = list(range(len(hosts)))
 
         if bench_parameters.collocate:
             workers = bench_parameters.workers
@@ -245,6 +262,7 @@ class Bench:
                 c.run(f'{CommandMaker.cleanup()} || true', hide=True)
                 c.put(PathMaker.committee_file(), '.')
                 c.put(PathMaker.key_file(i), '.')
+                c.put(PathMaker.threshold_key_file(i), '.')
                 c.put(PathMaker.parameters_file(), '.')
 
         return committee
@@ -256,34 +274,43 @@ class Bench:
         hosts = committee.ips()
         self.kill(hosts=hosts, delete_logs=True)
 
-        # Run the clients (they will wait for the nodes to be ready).
-        # Filter all faulty nodes from the client addresses (or they will wait
-        # for the faulty nodes to be online).
-        Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
         client_addresses = committee.client_addresses()
+        client_ack_addresses = committee.client_ack_addresses()
         rate_share = ceil(rate / committee.workers())
+
+        client_launch_plan = []
+        nodes = len(committee.primary_addresses(faults))
+        f = floor((nodes - 1) / 3)
+        Print.info(f"f: {f}")
         client_id = 0
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
-                # Get the corresponding client reply address
+                # Get the corresponding client reply and ack addresses
                 if client_id < len(client_addresses):
                     reply_addr = client_addresses[client_id]
+                    ack_addr = client_ack_addresses[client_id]
+                    metrics_file = PathMaker.client_metrics_file(i, id)
                     cmd = CommandMaker.run_client(
                         client_id,
                         reply_addr,
+                        ack_addr,
                         PathMaker.committee_file(),
                         PathMaker.key_file(i),
+                        PathMaker.threshold_key_file(i),
                         f'.db-client-{client_id}',
                         bench_parameters.tx_size,
                         rate_share,
                         bench_parameters.worker_fault_tolerance,
-                        threshold=1  # Default threshold
+                        threshold=f+1,
+                        duration=bench_parameters.duration,
+                        branch=self.settings.branch,
+                        metrics_file=metrics_file,
+                        transaction_timeout=bench_parameters.transaction_timeout
                     )
-                    print(cmd)
                     log_file = PathMaker.client_log_file(i, id)
-                    self._background_run(host, cmd, log_file)
+                    client_launch_plan.append((host, cmd, log_file, metrics_file))
                 client_id += 1
 
         # Run the primaries (except the faulty ones).
@@ -292,10 +319,12 @@ class Bench:
             host = Committee.ip(address)
             cmd = CommandMaker.run_primary(
                 PathMaker.key_file(i),
+                PathMaker.threshold_key_file(i),
                 PathMaker.committee_file(),
                 PathMaker.db_path(i),
                 PathMaker.parameters_file(),
-                debug=debug
+                debug=debug,
+                branch=self.settings.branch
             )
             log_file = PathMaker.primary_log_file(i)
             self._background_run(host, cmd, log_file)
@@ -307,30 +336,47 @@ class Bench:
                 host = Committee.ip(address)
                 cmd = CommandMaker.run_worker(
                     PathMaker.key_file(i),
+                    PathMaker.threshold_key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i, id),
                     PathMaker.parameters_file(),
                     id,  # The worker's id.
-                    debug=debug
+                    debug=debug,
+                    branch=self.settings.branch
                 )
                 log_file = PathMaker.worker_log_file(i, id)
                 self._background_run(host, cmd, log_file)
 
+        # Give primaries and workers a moment to boot before clients connect.
+        CLIENT_START_DELAY = 5
+        Print.info(f'Waiting {CLIENT_START_DELAY} sec for primaries/workers to boot...')
+        sleep(CLIENT_START_DELAY)
+
+        # Run the clients (they will wait for the nodes to be ready).
+        Print.info('Booting clients...')
+        for host, cmd, log_file, _ in client_launch_plan:
+            self._background_run(host, cmd, log_file)
+
          # Wait for all transactions to be processed.
         duration = bench_parameters.duration
-        for i in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
+        total_duration = duration + CLIENT_SHUTDOWN_GRACE
+        for i in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec + {CLIENT_SHUTDOWN_GRACE} sec drain):'):
             #tick_size = ceil(duration / 20)
             #print(tick_size, i, bench_parameters.partition_start, bench_parameters.simulate_partition)
             #if bench_parameters.simulate_partition and i*tick_size == bench_parameters.partition_start:
             #    print('simulating partition')
             #    self._simulate_partition(bench_parameters, committee, faults)
-            
+
             #if bench_parameters.simulate_partition and i*tick_size == bench_parameters.partition_start + bench_parameters.partition_duration:
             #    print('deleting partition')
             #    self._delete_partition(bench_parameters, committee, faults)
 
-            sleep(ceil(duration / 20))
+            sleep(ceil(total_duration / 20))
         self.kill(hosts=hosts, delete_logs=False)
+
+        # Wait for nodes to gracefully shutdown and flush metrics to disk
+        Print.info('Waiting for nodes to shutdown...')
+        sleep(1)
 
     def _simulate_partition(self, bench_parameters, committee, faults):
         partition_ips = []
@@ -395,7 +441,7 @@ class Bench:
         #    log_file = PathMaker.primary_log_file(i)
         #    self._background_run(host, cmd, log_file)
 
-    def _logs(self, committee, faults):
+    def _logs(self, committee, faults, warmup_seconds=0, cooldown_seconds=0):
         # Delete local logs (if any).
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
@@ -411,6 +457,15 @@ class Bench:
                     PathMaker.client_log_file(i, id), 
                     local=PathMaker.client_log_file(i, id)
                 )
+                try:
+                    c.get(
+                        PathMaker.client_metrics_file(i, id),
+                        local=PathMaker.client_metrics_file(i, id)
+                    )
+                except FileNotFoundError:
+                    Print.warn(f"Metrics file missing for client log client-{i}-{id}.log")
+                except IOError:
+                    Print.warn(f"Failed to download metrics file for client-{i}-{id}")
                 c.get(
                     PathMaker.worker_log_file(i, id), 
                     local=PathMaker.worker_log_file(i, id)
@@ -428,7 +483,12 @@ class Bench:
 
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
-        return LogParser.process(PathMaker.logs_path(), faults=faults)
+        return LogParser.process(
+            PathMaker.logs_path(),
+            faults=faults,
+            warmup_seconds=warmup_seconds,
+            cooldown_seconds=cooldown_seconds,
+        )
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
@@ -479,7 +539,12 @@ class Bench:
                         )
 
                         faults = bench_parameters.faults
-                        logger = self._logs(committee_copy, faults)
+                        logger = self._logs(
+                            committee_copy,
+                            faults,
+                            bench_parameters.latency_warmup,
+                            bench_parameters.latency_cooldown,
+                        )
                         logger.print(PathMaker.result_file(
                             faults,
                             n, 
