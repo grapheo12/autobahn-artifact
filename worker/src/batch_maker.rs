@@ -27,6 +27,7 @@ use std::pin::Pin;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration};
+use tokio_util::time::DelayQueue;
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -85,6 +86,8 @@ pub struct BatchMaker {
     partition_public_keys: HashSet<PublicKey>,
     // Partition queue for batch requests
     partition_queue: VecDeque<WorkerMessage>,
+    // Per-worker egress penalty (ms)
+    egress_penalty: u64,
     // Store
     store: Store,
     // Quorum waiter
@@ -105,6 +108,10 @@ pub struct BatchMaker {
     pub name: PublicKey,
     // async timer futures
     pub async_timer_futures: FuturesUnordered<Pin<Box<dyn Future<Output = (Slot, View)> + Send>>>,
+    // Whether this worker should apply egress delays
+    should_simulate_egress: bool,
+    // Queue for delaying outgoing messages during egress simulation
+    egress_delay_queue: DelayQueue<(Vec<SocketAddr>, Bytes)>,
 }
 
 impl BatchMaker {
@@ -124,6 +131,7 @@ impl BatchMaker {
         affected_nodes: VecDeque<u64>,
         keys: Vec<PublicKey>,
         name: PublicKey,
+        egress_penalty: u64,
     ) {
         tokio::spawn(async move {
             Self {
@@ -143,6 +151,7 @@ impl BatchMaker {
                 //partition_public_keys,
                 partition_public_keys: HashSet::new(),
                 partition_queue: VecDeque::new(),
+                egress_penalty,
                 store,
                 simulate_asynchrony,
                 asynchrony_type,
@@ -152,6 +161,8 @@ impl BatchMaker {
                 keys,
                 name,
                 async_timer_futures: FuturesUnordered::new(),
+                should_simulate_egress: false,
+                egress_delay_queue: DelayQueue::new(),
             }
             .run()
             .await;
@@ -212,6 +223,14 @@ impl BatchMaker {
                         self.should_simulate_failure = true;
                         debug!("Worker will simulate failure during async period {}", i);
                     }
+                } else if effect_type == AsyncEffectType::Egress {
+                    self.keys.sort();
+                    let index = self.keys.binary_search(&self.name).unwrap();
+
+                    if index < self.affected_nodes[i] as usize {
+                        self.should_simulate_egress = true;
+                        debug!("Worker will simulate egress delay during async period {}", i);
+                    }
                 }
             }
         }
@@ -262,6 +281,15 @@ impl BatchMaker {
                             debug!("partition queue size is {:?}", self.partition_queue.len());
                         }
                         self.current_effect_type = AsyncEffectType::Off;
+                    }
+                },
+                Some(result) = self.egress_delay_queue.next() => {
+                    match result {
+                        Ok(item) => {
+                            let (addresses, bytes) = item.into_inner();
+                            self.network.broadcast(addresses, bytes).await;
+                        }
+                        Err(e) => warn!("BatchMaker egress delay timer error: {}", e),
                     }
                 },
 
@@ -390,6 +418,20 @@ impl BatchMaker {
                     self.partition_queue.push_back(message);
                     debug!("partition queue size is {:?}", self.partition_queue.len());
                     self.network.broadcast(new_addresses, bytes).await;
+                }
+                AsyncEffectType::Egress => {
+                    if self.should_simulate_egress {
+                        let (_, addresses): (Vec<_>, _) =
+                            self.workers_addresses.iter().cloned().unzip();
+                        self.egress_delay_queue.insert(
+                            (addresses, bytes.clone()),
+                            Duration::from_millis(self.egress_penalty),
+                        );
+                    } else {
+                        let (_, addresses): (Vec<_>, _) =
+                            self.workers_addresses.iter().cloned().unzip();
+                        self.network.broadcast(addresses, bytes).await;
+                    }
                 }
                 _ => {
                     // For other async types, send normally (could be extended for other effects)

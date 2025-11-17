@@ -5,7 +5,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, warn};
 use network::CancelHandler;
 use network::ReliableSender;
 use network::SimpleSender;
@@ -13,11 +13,13 @@ use primary::timer::Timer;
 use primary::Height;
 use primary::PrimaryWorkerMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use tokio_util::time::DelayQueue;
 
 #[cfg(test)]
 #[path = "tests/synchronizer_tests.rs"]
@@ -38,6 +40,11 @@ fn uint_to_enum(v: u8) -> AsyncEffectType {
 
 /// Resolution of the timer managing retrials of sync requests (in ms).
 const TIMER_RESOLUTION: u64 = 100;
+
+enum DelayedSyncMessage {
+    Direct(SocketAddr, Bytes),
+    Broadcast(Vec<SocketAddr>, Bytes),
+}
 
 // The `Synchronizer` is responsible to keep the worker in sync with the others.
 pub struct Synchronizer {
@@ -80,6 +87,9 @@ pub struct Synchronizer {
     during_simulated_asynchrony: bool,
     current_effect_type: AsyncEffectType,
     should_simulate_failure: bool,
+    should_simulate_egress: bool,
+    egress_penalty: u64,
+    egress_delay_queue: DelayQueue<DelayedSyncMessage>,
     // Timers for async period transitions
     async_timer_futures: FuturesUnordered<Pin<Box<Timer>>>,
 }
@@ -100,6 +110,7 @@ impl Synchronizer {
         asynchrony_start: VecDeque<u64>,
         asynchrony_duration: VecDeque<u64>,
         affected_nodes: VecDeque<u64>,
+        egress_penalty: u64,
     ) {
         tokio::spawn(async move {
             let mut keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
@@ -128,6 +139,9 @@ impl Synchronizer {
                 during_simulated_asynchrony: false,
                 current_effect_type: AsyncEffectType::Off,
                 should_simulate_failure: false,
+                should_simulate_egress: false,
+                egress_penalty,
+                egress_delay_queue: DelayQueue::new(),
                 async_timer_futures: FuturesUnordered::new(),
             };
 
@@ -141,6 +155,15 @@ impl Synchronizer {
                             synchronizer.should_simulate_failure = true;
                             debug!(
                                 "Synchronizer will simulate failure during async period {}",
+                                i
+                            );
+                        }
+                    } else if effect_type == AsyncEffectType::Egress {
+                        let index = synchronizer.keys.binary_search(&synchronizer.name).unwrap();
+                        if index < synchronizer.affected_nodes[i] as usize {
+                            synchronizer.should_simulate_egress = true;
+                            debug!(
+                                "Synchronizer will simulate egress delay during async period {}",
                                 i
                             );
                         }
@@ -243,17 +266,26 @@ impl Synchronizer {
                         };
                         let message = WorkerMessage::BatchRequest(missing.clone(), self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+                        let bytes = Bytes::from(serialized);
 
                         debug!("Requesting sync for missing {:?}, address is {:?}", missing, address);
 
-                        // Check if we should drop messages during failure simulation
+                        // Check if we should drop or delay messages during simulation
                         if self.during_simulated_asynchrony &&
                            self.current_effect_type == AsyncEffectType::Failure &&
                            self.should_simulate_failure {
                             debug!("Synchronizer failure simulation: dropping sync request during failure period");
                             // Don't send any sync requests - simulate complete failure
+                        } else if self.during_simulated_asynchrony &&
+                                  self.current_effect_type == AsyncEffectType::Egress &&
+                                  self.should_simulate_egress {
+                            debug!("Synchronizer egress simulation: delaying sync request during egress period");
+                            self.egress_delay_queue.insert(
+                                DelayedSyncMessage::Direct(address, bytes),
+                                Duration::from_millis(self.egress_penalty),
+                            );
                         } else {
-                            self.network.send(address, Bytes::from(serialized)).await;
+                            self.network.send(address, bytes).await;
                         }
 
                     },
@@ -322,10 +354,22 @@ impl Synchronizer {
                                 .collect();
                             let message = WorkerMessage::BatchRequest(retry.clone(), self.name);
                             let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+                            let bytes = Bytes::from(serialized);
                             debug!("Sending retry sync requests for {:?}", retry);
-                            self.network
-                                .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
-                                .await;
+
+                            if self.during_simulated_asynchrony &&
+                               self.current_effect_type == AsyncEffectType::Egress &&
+                               self.should_simulate_egress {
+                                debug!("Synchronizer egress simulation: delaying retry sync request during egress period");
+                                self.egress_delay_queue.insert(
+                                    DelayedSyncMessage::Broadcast(addresses, bytes),
+                                    Duration::from_millis(self.egress_penalty),
+                                );
+                            } else {
+                                self.network
+                                    .lucky_broadcast(addresses, bytes, self.sync_retry_nodes)
+                                    .await;
+                            }
                         }
                     }
 
@@ -348,6 +392,22 @@ impl Synchronizer {
                         // Ending async period
                         debug!("Synchronizer async period ended, effect was: {:?}", self.current_effect_type);
                         self.current_effect_type = AsyncEffectType::Off;
+                    }
+                },
+
+                Some(result) = self.egress_delay_queue.next() => {
+                    match result {
+                        Ok(item) => match item.into_inner() {
+                            DelayedSyncMessage::Direct(address, bytes) => {
+                                self.network.send(address, bytes).await;
+                            }
+                            DelayedSyncMessage::Broadcast(addresses, bytes) => {
+                                self.network
+                                    .lucky_broadcast(addresses, bytes, self.sync_retry_nodes)
+                                    .await;
+                            }
+                        },
+                        Err(e) => warn!("Synchronizer egress delay timer error: {}", e),
                     }
                 }
             }

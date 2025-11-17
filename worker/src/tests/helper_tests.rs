@@ -35,6 +35,7 @@ async fn batch_reply() {
         VecDeque::new(),
         VecDeque::new(),
         VecDeque::new(),
+        0,
     );
 
     // Spawn a listener to receive the batch reply.

@@ -31,7 +31,7 @@ def local(ctx, debug=True):
         'partition_nodes': 1,
     }
     node_params = {
-        'timeout_delay': 5_000,  # ms
+        'timeout_delay': 1_000,  # ms
         'header_size': 32,  # bytes
         'max_header_delay': 5,  # ms
         'gc_depth': 50,  # rounds

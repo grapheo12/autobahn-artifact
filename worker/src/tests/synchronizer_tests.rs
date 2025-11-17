@@ -34,6 +34,7 @@ async fn synchronize() {
         VecDeque::new(),
         VecDeque::new(),
         VecDeque::new(),
+        0,
     );
 
     // Spawn a listener to receive our batch requests.

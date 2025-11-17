@@ -9,10 +9,12 @@ use network::CancelHandler;
 use network::{ReliableSender, SimpleSender};
 use primary::timer::Timer;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{sleep, Duration};
+use tokio_util::time::DelayQueue;
 
 #[cfg(test)]
 #[path = "tests/helper_tests.rs"]
@@ -58,6 +60,9 @@ pub struct Helper {
     during_simulated_asynchrony: bool,
     current_effect_type: AsyncEffectType,
     should_simulate_failure: bool,
+    should_simulate_egress: bool,
+    egress_penalty: u64,
+    egress_delay_queue: DelayQueue<(SocketAddr, Bytes)>,
     // Timers for async period transitions
     async_timer_futures: FuturesUnordered<Pin<Box<Timer>>>,
 }
@@ -74,6 +79,7 @@ impl Helper {
         asynchrony_start: VecDeque<u64>,
         asynchrony_duration: VecDeque<u64>,
         affected_nodes: VecDeque<u64>,
+        egress_penalty: u64,
     ) {
         tokio::spawn(async move {
             let mut keys: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
@@ -97,6 +103,9 @@ impl Helper {
                 during_simulated_asynchrony: false,
                 current_effect_type: AsyncEffectType::Off,
                 should_simulate_failure: false,
+                should_simulate_egress: false,
+                egress_penalty,
+                egress_delay_queue: DelayQueue::new(),
                 async_timer_futures: FuturesUnordered::new(),
             };
 
@@ -109,6 +118,12 @@ impl Helper {
                         if index < helper.affected_nodes[i] as usize {
                             helper.should_simulate_failure = true;
                             debug!("Helper will simulate failure during async period {}", i);
+                        }
+                    } else if effect_type == AsyncEffectType::Egress {
+                        let index = helper.keys.binary_search(&helper.name).unwrap();
+                        if index < helper.affected_nodes[i] as usize {
+                            helper.should_simulate_egress = true;
+                            debug!("Helper will simulate egress delay during async period {}", i);
                         }
                     }
                 }
@@ -164,7 +179,18 @@ impl Helper {
                         match self.store.read(digest.to_vec()).await {
                             Ok(Some(data)) => {
                                 debug!("have digest {:?} in store", digest);
-                                self.network.send(address, Bytes::from(data)).await;
+                                let bytes = Bytes::from(data);
+                                if self.during_simulated_asynchrony
+                                    && self.current_effect_type == AsyncEffectType::Egress
+                                    && self.should_simulate_egress
+                                {
+                                    self.egress_delay_queue.insert(
+                                        (address, bytes),
+                                        Duration::from_millis(self.egress_penalty),
+                                    );
+                                } else {
+                                    self.network.send(address, bytes).await;
+                                }
                             },
                             Ok(None) => {
                                 debug!("don't have digest {:?} in store", digest);
@@ -189,6 +215,16 @@ impl Helper {
                         // Ending async period
                         debug!("Helper async period ended, effect was: {:?}", self.current_effect_type);
                         self.current_effect_type = AsyncEffectType::Off;
+                    }
+                },
+
+                Some(result) = self.egress_delay_queue.next() => {
+                    match result {
+                        Ok(item) => {
+                            let (address, bytes) = item.into_inner();
+                            self.network.send(address, bytes).await;
+                        }
+                        Err(e) => warn!("Helper egress delay timer error: {}", e),
                     }
                 }
             }

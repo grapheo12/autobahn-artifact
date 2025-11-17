@@ -164,6 +164,7 @@ impl Worker {
             self.parameters.asynchrony_start.clone(),
             self.parameters.asynchrony_duration.clone(),
             self.parameters.affected_nodes.clone(),
+            self.parameters.egress_penalty,
         );
 
         // Spawn ReplySender component to handle SlotCommittedMessage
@@ -173,6 +174,12 @@ impl Worker {
             self.committee.clone(),
             self.id,
             self.name,
+            self.parameters.simulate_asynchrony,
+            self.parameters.asynchrony_type.clone(),
+            self.parameters.asynchrony_start.clone(),
+            self.parameters.asynchrony_duration.clone(),
+            self.parameters.affected_nodes.clone(),
+            self.parameters.egress_penalty,
         );
 
         // Spawn CertificateAckSender component to handle CertificateFormed messages
@@ -270,6 +277,7 @@ impl Worker {
             self.parameters.affected_nodes.clone(),
             self.committee.authorities.keys().cloned().collect(),
             self.name.clone(),
+            self.parameters.egress_penalty,
         );
 
         // // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -338,6 +346,7 @@ impl Worker {
             self.parameters.asynchrony_start.clone(),
             self.parameters.asynchrony_duration.clone(),
             self.parameters.affected_nodes.clone(),
+            self.parameters.egress_penalty,
         );
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
