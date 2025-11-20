@@ -145,7 +145,7 @@ pub struct Parameters {
     // pub asynchrony_start: u64,
     // pub asynchrony_duration: u64,
     pub simulate_asynchrony: bool,          //Simulating an async event
-    pub asynchrony_type: VecDeque<u8>, //Type of effects: 0 for delay full async duration, 1 for partition, 2 for  failure, 3 for egress delay. Will start #type many blips.
+    pub asynchrony_type: VecDeque<u8>, //Effect codes: 0=off/full delay, 1=temp blip, 2=failure, 3=partition, 4=egress delay, 5=slowdown stall
     pub asynchrony_start: VecDeque<u64>, //Start of async period   //offset from current time (in seconds) when to start next async effect
     pub asynchrony_duration: VecDeque<u64>, //Duration of async period
     pub affected_nodes: VecDeque<u64>,   ////first k nodes experience specified async behavior

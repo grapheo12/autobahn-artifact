@@ -43,13 +43,14 @@ pub type View = u64;
 // The slot (sequence) number of consensus
 pub type Slot = u64;
 
-#[derive(Clone, PartialEq, std::fmt::Debug)]
+#[derive(Copy, Clone, PartialEq, std::fmt::Debug)]
 pub enum AsyncEffectType {
     Off = 0,
     TempBlip = 1,  //Send nothing for x seconds, and then release all messages
     Failure = 2,   //Send nothing for x seconds  //TODO: Combine with TempBlip?
     Partition = 3, //Send nothing to partitioned replicas for x seconds, then release all
     Egress = 4,    //For x seconds, delay all outbound messages by some amount
+    Slowdown = 5,  //Completely stall the worker for the async duration
 }
 fn uint_to_enum(v: u8) -> AsyncEffectType {
     unsafe { std::mem::transmute(v) }
@@ -177,62 +178,76 @@ impl BatchMaker {
         tokio::pin!(timer);
 
         if self.simulate_asynchrony {
-            for i in 0..self.asynchrony_start.len() {
-                let start_offset = self.asynchrony_start[i];
-                let end_offset = start_offset + self.asynchrony_duration[i];
+            self.keys.sort();
+            let configured_types: Vec<_> = self.asynchrony_type.iter().copied().collect();
+            let configured_starts: Vec<_> = self.asynchrony_start.iter().copied().collect();
+            let configured_durations: Vec<_> = self.asynchrony_duration.iter().copied().collect();
+            let configured_affected: Vec<_> = self.affected_nodes.iter().copied().collect();
+            let self_index = self.keys.binary_search(&self.name).unwrap();
+            let mut scheduled_types = VecDeque::new();
+            let mut scheduled_durations = VecDeque::new();
 
-                let async_start = Timer::new(0, 0, start_offset);
-                let async_end = Timer::new(0, 0, end_offset);
+            for i in 0..configured_starts.len() {
+                let effect_type = uint_to_enum(configured_types[i]);
+                let start_offset = configured_starts[i];
+                let duration = configured_durations[i];
+                let affected = configured_affected[i] as usize;
 
-                self.async_timer_futures.push(Box::pin(async_start));
-                self.async_timer_futures.push(Box::pin(async_end));
+                if matches!(
+                    effect_type,
+                    AsyncEffectType::Failure | AsyncEffectType::Egress | AsyncEffectType::Slowdown
+                ) && self_index >= affected
+                {
+                    continue;
+                }
 
-                let effect_type = uint_to_enum(self.asynchrony_type[i]);
+                if effect_type == AsyncEffectType::Slowdown {
+                    let async_start = Timer::new(0, 0, start_offset);
+                    self.async_timer_futures.push(Box::pin(async_start));
+                } else {
+                    let async_start = Timer::new(0, 0, start_offset);
+                    let async_end = Timer::new(0, 0, start_offset + duration);
 
-                if effect_type == AsyncEffectType::Partition {
-                    self.keys.sort();
-                    let index = self.keys.binary_search(&self.name).unwrap();
+                    self.async_timer_futures.push(Box::pin(async_start));
+                    self.async_timer_futures.push(Box::pin(async_end));
+                }
 
-                    // Figure out which partition we are in, partition_nodes indicates when the left partition ends
-                    let mut start: usize = 0;
-                    let mut end: usize = 0;
+                match effect_type {
+                    AsyncEffectType::Partition => {
+                        let mut start: usize = 0;
+                        let mut end: usize = 0;
 
-                    // We are in the right partition
-                    if index > self.affected_nodes[i] as usize - 1 {
-                        start = self.affected_nodes[i] as usize;
-                        end = self.keys.len();
-                    } else {
-                        // We are in the left partition
-                        start = 0;
-                        end = self.affected_nodes[i] as usize;
+                        if self_index > affected.saturating_sub(1) {
+                            start = affected;
+                            end = self.keys.len();
+                        } else {
+                            start = 0;
+                            end = affected;
+                        }
+
+                        for j in start..end {
+                            self.partition_public_keys.insert(self.keys[j]);
+                        }
+
+                        debug!("partition pks are {:?}", self.partition_public_keys);
                     }
-
-                    // These are the nodes in our side of the partition
-                    for j in start..end {
-                        self.partition_public_keys.insert(self.keys[j]);
-                    }
-
-                    debug!("partition pks are {:?}", self.partition_public_keys);
-                } else if effect_type == AsyncEffectType::Failure {
-                    // Check if this worker should simulate failure
-                    self.keys.sort();
-                    let index = self.keys.binary_search(&self.name).unwrap();
-
-                    // Only workers for nodes below affected_nodes threshold simulate failure
-                    if index < self.affected_nodes[i] as usize {
+                    AsyncEffectType::Failure => {
                         self.should_simulate_failure = true;
                         debug!("Worker will simulate failure during async period {}", i);
                     }
-                } else if effect_type == AsyncEffectType::Egress {
-                    self.keys.sort();
-                    let index = self.keys.binary_search(&self.name).unwrap();
-
-                    if index < self.affected_nodes[i] as usize {
+                    AsyncEffectType::Egress => {
                         self.should_simulate_egress = true;
                         debug!("Worker will simulate egress delay during async period {}", i);
                     }
+                    _ => {}
                 }
+
+                scheduled_types.push_back(configured_types[i]);
+                scheduled_durations.push_back(duration);
             }
+
+            self.asynchrony_type = scheduled_types;
+            self.asynchrony_duration = scheduled_durations;
         }
 
         /*let timer1 = sleep(Duration::from_secs(10));
@@ -270,9 +285,18 @@ impl BatchMaker {
 
                     if self.during_simulated_asynchrony {
                         // Starting async period - determine effect type
-                        if !self.asynchrony_type.is_empty() {
-                            self.current_effect_type = uint_to_enum(self.asynchrony_type.pop_front().unwrap());
+                        if let Some(effect_raw) = self.asynchrony_type.pop_front() {
+                            self.current_effect_type = uint_to_enum(effect_raw);
+                            let duration = self.asynchrony_duration.pop_front().unwrap_or(0);
                             debug!("Worker async period started with effect type: {:?}", self.current_effect_type);
+
+                            if self.current_effect_type == AsyncEffectType::Slowdown {
+                                if duration > 0 {
+                                    sleep(Duration::from_millis(duration)).await;
+                                }
+                                self.during_simulated_asynchrony = false;
+                                self.current_effect_type = AsyncEffectType::Off;
+                            }
                         }
                     } else {
                         // Ending async period
@@ -432,6 +456,9 @@ impl BatchMaker {
                             self.workers_addresses.iter().cloned().unzip();
                         self.network.broadcast(addresses, bytes).await;
                     }
+                }
+                AsyncEffectType::Slowdown => {
+                    debug!("BatchMaker slowdown: dropping batch during slowdown period");
                 }
                 _ => {
                     // For other async types, send normally (could be extended for other effects)

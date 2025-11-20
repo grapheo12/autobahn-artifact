@@ -41,13 +41,14 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
-#[derive(Clone, PartialEq, std::fmt::Debug)]
+#[derive(Copy, Clone, PartialEq, std::fmt::Debug)]
 pub enum AsyncEffectType {
     Off = 0,
     TempBlip = 1, //Send nothing for x seconds, and then release all messages
     Failure = 2, //Send nothing for x seconds  //TODO: Combine with TempBlip?
     Partition = 3, //Send nothing to partitioned replicas for x seconds, then release all
-    Egress = 4,  //For x seconds, delay all outbound messages by some amount
+    Egress = 4,    //For x seconds, delay all outbound messages by some amount
+    Slowdown = 5,  //Completely stall the replica for the async duration
 }
 fn uint_to_enum(v: u8) -> AsyncEffectType {
     unsafe { std::mem::transmute(v) }
@@ -1730,65 +1731,70 @@ impl Core {
                     self.async_timer_futures.push(Box::pin(async_end));*/
                     
                     self.already_set_timers = true;
-                    debug!("asynchrony start is {:?}", self.asynchrony_start);
-                    for i in 0..self.asynchrony_start.len() {
-                        if self.asynchrony_type[i] == AsyncEffectType::Failure {
-                            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-                            keys.sort();
-                            let index = keys.binary_search(&self.name).unwrap();
-                            // Skip nodes that are not affected by the asynchrony
-                            if index >= self.affected_nodes[i] as usize {
-                                continue;
-                            }
+                    let configured_types: Vec<_> = self.asynchrony_type.iter().cloned().collect();
+                    let configured_starts: Vec<_> = self.asynchrony_start.iter().cloned().collect();
+                    let configured_durations: Vec<_> =
+                        self.asynchrony_duration.iter().cloned().collect();
+                    let configured_affected: Vec<_> = self.affected_nodes.iter().cloned().collect();
+                    let mut scheduled_types = VecDeque::new();
+                    let mut scheduled_durations = VecDeque::new();
+                    let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+                    keys.sort();
+                    let self_index = keys.binary_search(&self.name).unwrap();
+
+                    for i in 0..configured_starts.len() {
+                        let effect_type = configured_types[i];
+                        let affected = configured_affected[i] as usize;
+                        let start_offset = configured_starts[i];
+                        let duration = configured_durations[i];
+
+                        if matches!(
+                            effect_type,
+                            AsyncEffectType::Failure
+                                | AsyncEffectType::Egress
+                                | AsyncEffectType::Slowdown
+                        ) && self_index >= affected
+                        {
+                            continue;
                         }
-                        
-                        if self.asynchrony_type[i] == AsyncEffectType::Egress {
-                            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-                            keys.sort();
-                            let index = keys.binary_search(&self.name).unwrap();
-                            // Skip nodes that are not affected by the asynchrony
-                            if index >= self.affected_nodes[i] as usize {
-                                continue;
-                            }
+
+                        if effect_type == AsyncEffectType::Slowdown {
+                            let async_start = Timer::new(0, 0, start_offset);
+                            self.async_timer_futures.push(Box::pin(async_start));
+                        } else {
+                            let async_start = Timer::new(0, 0, start_offset);
+                            let async_end = Timer::new(0, 0, start_offset + duration);
+
+                            self.async_timer_futures.push(Box::pin(async_start));
+                            self.async_timer_futures.push(Box::pin(async_end));
                         }
-                        
-                        let start_offset = self.asynchrony_start[i];
-                        let end_offset = start_offset +  self.asynchrony_duration[i];
-                        
-                        let async_start = Timer::new(0, 0, start_offset);
-                        let async_end = Timer::new(0, 0, end_offset);
 
-                        self.async_timer_futures.push(Box::pin(async_start));
-                        self.async_timer_futures.push(Box::pin(async_end));
-
-                        if self.asynchrony_type[i] == AsyncEffectType::Partition {
-                            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-                            keys.sort();
-                            let index = keys.binary_search(&self.name).unwrap();
-
-                            // Figure out which partition we are in, partition_nodes indicates when the left partition ends
+                        if effect_type == AsyncEffectType::Partition {
                             let mut start: usize = 0;
                             let mut end: usize = 0;
-                        
-                            // We are in the right partition
-                            if index > self.affected_nodes[i] as usize - 1 {
-                                start = self.affected_nodes[i] as usize;
+
+                            if self_index > affected.saturating_sub(1) {
+                                start = affected;
                                 end = keys.len();
                             
                             } else {
-                                // We are in the left partition
                                 start = 0;
-                                end = self.affected_nodes[i] as usize;
+                                end = affected;
                             }
 
-                            // These are the nodes in our side of the partition
                             for j in start..end {
                                 self.partition_public_keys.insert(keys[j]);
                             }
 
                             debug!("partition pks are {:?}", self.partition_public_keys);
-                        } 
+                        }
+
+                        scheduled_types.push_back(effect_type);
+                        scheduled_durations.push_back(duration);
                     }
+
+                    self.asynchrony_type = scheduled_types;
+                    self.asynchrony_duration = scheduled_durations;
                 }
 
                 //Stop timer for this slot/view //Note: Ideally stop all timers for this slot, but timers for older views are obsolete anyways.
@@ -2331,10 +2337,11 @@ impl Core {
         match self.current_effect_type {
             AsyncEffectType::Off => {
                 debug!("message sent normally");
-                self.send_msg_normal(message, height, author, consensus_handler).await;
-                /*let release_time = Instant::now() + Duration::from_millis(self.egress_penalty);
+                /*self.send_msg_normal(message, height, author, consensus_handler)
+                    .await;*/
+                let release_time = Instant::now() + Duration::from_millis(10);
                 self.egress_delay_queue
-                    .insert_at((message, height, author, consensus_handler), release_time);*/
+                    .insert_at((message, height, author, consensus_handler), release_time);
             }
             AsyncEffectType::TempBlip => { //Our old handling
                 //add message
@@ -2434,6 +2441,9 @@ impl Core {
                 let release_time = Instant::now() + Duration::from_millis(self.egress_penalty);
                 self.egress_delay_queue
                     .insert_at((message, height, author, consensus_handler), release_time);
+            }
+            AsyncEffectType::Slowdown => {
+                debug!("Slowdown simulation: dropping outgoing message during slowdown period");
             }
 
             _ => {
@@ -2724,14 +2734,21 @@ impl Core {
 
                     if self.during_simulated_asynchrony {
                         debug!("asynchrony type is {:?}", self.asynchrony_type);
-                        self.current_effect_type = self.asynchrony_type.pop_front().unwrap();
+                        if let Some(effect) = self.asynchrony_type.pop_front() {
+                            self.current_effect_type = effect;
+                            let duration = self.asynchrony_duration.pop_front().unwrap_or(0);
 
-                        if self.current_effect_type == AsyncEffectType::Egress {
-                            // Start the first egress timer
-                            //self.egress_timer.reset();
-                            let async_duration = self.asynchrony_duration.pop_front().unwrap();
-                            self.current_egress_end = Instant::now() + Duration::from_millis(async_duration);
-                            debug!("End of egress is {:?}", self.current_egress_end);
+                            if self.current_effect_type == AsyncEffectType::Egress {
+                                self.current_egress_end =
+                                    Instant::now() + Duration::from_millis(duration);
+                                debug!("End of egress is {:?}", self.current_egress_end);
+                            } else if self.current_effect_type == AsyncEffectType::Slowdown {
+                                if duration > 0 {
+                                    sleep(Duration::from_millis(duration)).await;
+                                }
+                                self.during_simulated_asynchrony = false;
+                                self.current_effect_type = AsyncEffectType::Off;
+                            }
                         }
                     }
 

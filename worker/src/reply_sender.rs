@@ -14,17 +14,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
-use tokio::time::Duration;
+use tokio::time::{sleep, Duration};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::time::DelayQueue;
 
-#[derive(Clone, PartialEq, std::fmt::Debug)]
+#[derive(Copy, Clone, PartialEq, std::fmt::Debug)]
 pub enum AsyncEffectType {
     Off = 0,
     TempBlip = 1,
     Failure = 2,
     Partition = 3,
     Egress = 4,
+    Slowdown = 5,
 }
 
 fn uint_to_enum(v: u8) -> AsyncEffectType {
@@ -247,16 +248,45 @@ impl ReplySender {
         );
 
         if self.simulate_asynchrony {
-            for i in 0..self.asynchrony_start.len() {
-                let start_offset = self.asynchrony_start[i] * 1000;
-                let end_offset = start_offset + (self.asynchrony_duration[i] * 1000);
+            let configured_types: Vec<_> = self.asynchrony_type.iter().copied().collect();
+            let configured_starts: Vec<_> = self.asynchrony_start.iter().copied().collect();
+            let configured_durations: Vec<_> = self.asynchrony_duration.iter().copied().collect();
+            let configured_affected: Vec<_> = self.affected_nodes.iter().copied().collect();
+            let self_index = self.keys.binary_search(&self.worker_key).unwrap();
+            let mut scheduled_types = VecDeque::new();
+            let mut scheduled_durations = VecDeque::new();
 
-                let async_start = Timer::new(0, 0, start_offset);
-                let async_end = Timer::new(0, 0, end_offset);
+            for i in 0..configured_starts.len() {
+                let effect_type = uint_to_enum(configured_types[i]);
+                let start_offset = configured_starts[i] * 1000;
+                let duration = configured_durations[i] * 1000;
+                let affected = configured_affected[i] as usize;
 
-                self.async_timer_futures.push(Box::pin(async_start));
-                self.async_timer_futures.push(Box::pin(async_end));
+                if matches!(
+                    effect_type,
+                    AsyncEffectType::Failure | AsyncEffectType::Egress | AsyncEffectType::Slowdown
+                ) && self_index >= affected
+                {
+                    continue;
+                }
+
+                if effect_type == AsyncEffectType::Slowdown {
+                    let async_start = Timer::new(0, 0, start_offset);
+                    self.async_timer_futures.push(Box::pin(async_start));
+                } else {
+                    let async_start = Timer::new(0, 0, start_offset);
+                    let async_end = Timer::new(0, 0, start_offset + duration);
+
+                    self.async_timer_futures.push(Box::pin(async_start));
+                    self.async_timer_futures.push(Box::pin(async_end));
+                }
+
+                scheduled_types.push_back(configured_types[i]);
+                scheduled_durations.push_back(duration);
             }
+
+            self.asynchrony_type = scheduled_types;
+            self.asynchrony_duration = scheduled_durations;
         }
 
         // Initialize empty connection map - connections will be established lazily
@@ -270,9 +300,18 @@ impl ReplySender {
                 Some((_, _)) = self.async_timer_futures.next() => {
                     self.during_simulated_asynchrony = !self.during_simulated_asynchrony;
                     if self.during_simulated_asynchrony {
-                        if !self.asynchrony_type.is_empty() {
-                            self.current_effect_type = uint_to_enum(self.asynchrony_type.pop_front().unwrap());
+                        if let Some(effect_raw) = self.asynchrony_type.pop_front() {
+                            self.current_effect_type = uint_to_enum(effect_raw);
+                            let duration = self.asynchrony_duration.pop_front().unwrap_or(0);
                             debug!("ReplySender async period started with effect type: {:?}", self.current_effect_type);
+
+                            if self.current_effect_type == AsyncEffectType::Slowdown {
+                                if duration > 0 {
+                                    sleep(Duration::from_millis(duration)).await;
+                                }
+                                self.during_simulated_asynchrony = false;
+                                self.current_effect_type = AsyncEffectType::Off;
+                            }
                         }
                     } else {
                         debug!("ReplySender async period ended, effect was: {:?}", self.current_effect_type);
