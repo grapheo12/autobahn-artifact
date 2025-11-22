@@ -22,7 +22,7 @@ def local(ctx, debug=True):
         'duration': 20,
         'latency_warmup': 2,
         'latency_cooldown': 2,
-        'transaction_timeout': 75,  # ms - timeout for early ACKs before retry
+        'transaction_timeout': 200,  # ms - timeout for early ACKs before retry
 
         # Unused
         'simulate_partition': True,
@@ -54,7 +54,7 @@ def local(ctx, debug=True):
         'asynchrony_type': [5],
 
         'asynchrony_start': [10_000], #ms
-        'asynchrony_duration': [1_500], #ms
+        'asynchrony_duration': [1_000], #ms
         'affected_nodes': [1],
         'egress_penalty': 40, #ms
 

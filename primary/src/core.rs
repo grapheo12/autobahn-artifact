@@ -2337,11 +2337,11 @@ impl Core {
         match self.current_effect_type {
             AsyncEffectType::Off => {
                 debug!("message sent normally");
-                /*self.send_msg_normal(message, height, author, consensus_handler)
-                    .await;*/
-                let release_time = Instant::now() + Duration::from_millis(10);
+                self.send_msg_normal(message, height, author, consensus_handler)
+                    .await;
+                /*let release_time = Instant::now() + Duration::from_millis(10);
                 self.egress_delay_queue
-                    .insert_at((message, height, author, consensus_handler), release_time);
+                    .insert_at((message, height, author, consensus_handler), release_time);*/
             }
             AsyncEffectType::TempBlip => { //Our old handling
                 //add message

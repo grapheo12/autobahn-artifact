@@ -170,6 +170,7 @@ impl TransactionSender {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
         const SAMPLE_LOG_INTERVAL: u64 = 1_000; // Limit high-volume sample logs.
+        const SAMPLES_PER_BURST: u64 = 100; // Number of sample transactions per burst interval.
 
         // The transaction size must be at least 10 bytes (1 byte type + 1 byte client_id + 8 bytes counter).
         if self.parameters.transaction_size < 10 {
@@ -271,6 +272,7 @@ impl TransactionSender {
 
         // Submit all transactions
         let burst = self.parameters.transaction_rate / PRECISION;
+        let sample_interval = burst / SAMPLES_PER_BURST; // Sample every Nth transaction within a burst
         let mut tx = BytesMut::with_capacity(self.parameters.transaction_size);
         let mut counter = 0;
         let mut r = rand::thread_rng().gen();
@@ -294,7 +296,8 @@ impl TransactionSender {
             let now = Instant::now();
 
             for x in 0..burst {
-                if x == counter % burst {
+                // Sample every sample_interval transactions to get SAMPLES_PER_BURST samples per burst
+                if x % sample_interval == 0 {
                     /*if log::log_enabled!(log::Level::Info)
                         && (counter < 10 || counter % SAMPLE_LOG_INTERVAL == 0)
                     {
@@ -304,14 +307,17 @@ impl TransactionSender {
                         );
                     }*/
 
+                    // Use unique ID: counter * burst + x to ensure each sample has a unique ID
+                    let sample_id = counter * burst + x;
+
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u8(self.client_id); // Client ID for uniqueness.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(sample_id); // This counter identifies the tx.
 
                     let send_instant = StdInstant::now();
                     let send_time = SystemTime::now();
                     self.metrics
-                        .record_send(counter, send_instant, send_time, true)
+                        .record_send(sample_id, send_instant, send_time, true)
                         .await;
                 } else {
                     r += 1;
@@ -343,7 +349,11 @@ impl TransactionSender {
                 }
 
                 // Register timeout if timeout is enabled and we successfully sent
-                let current_tx_id = if x == counter % burst { counter } else { r };
+                let current_tx_id = if x % sample_interval == 0 {
+                    counter * burst + x
+                } else {
+                    r
+                };
                 if self.parameters.transaction_timeout > 0 && successful_send {
                     // Enqueue timeout event handled centrally by delay queue worker.
                     if let Err(e) = self
