@@ -174,12 +174,6 @@ impl Worker {
             self.committee.clone(),
             self.id,
             self.name,
-            self.parameters.simulate_asynchrony,
-            self.parameters.asynchrony_type.clone(),
-            self.parameters.asynchrony_start.clone(),
-            self.parameters.asynchrony_duration.clone(),
-            self.parameters.affected_nodes.clone(),
-            self.parameters.egress_penalty,
         );
 
         // Spawn CertificateAckSender component to handle CertificateFormed messages
