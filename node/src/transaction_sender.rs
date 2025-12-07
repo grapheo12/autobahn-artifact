@@ -333,7 +333,13 @@ impl TransactionSender {
                         .await;
                 }
 
-                tx.resize(self.parameters.transaction_size, 0u8); // Pad to target size
+                // tx.resize(self.parameters.transaction_size, 0u8); // Pad to target size
+                if tx.len() < self.parameters.transaction_size {
+                    let remaining_size = self.parameters.transaction_size - tx.len();
+                    let mut random_bytes = vec![0u8; remaining_size];
+                    rand::thread_rng().fill(&mut random_bytes[..]);
+                    tx.extend_from_slice(&random_bytes);
+                }
                 let bytes = tx.split().freeze(); // Move content and make immutable for sharing
 
                 // Optimistic send: Send only to the first worker (co-located)
